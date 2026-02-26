@@ -26,6 +26,7 @@ xlrd>=2.0.0
 
 # Presentation artifacts
 python-pptx>=0.6.23
+playwright>=1.40.0
 
 # Utilities
 tqdm>=4.65.0
