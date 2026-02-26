@@ -1,0 +1,141 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\title{Customer Lifetime Value Prediction\\Presentation Notes}
+\author{The Starks\\
+Othmane Zizi (261255341)\\
+Fares Joni (261254593)\\
+Tanmay Giri (261272443)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Repository}
+\url{https://github.com/othmane-zizi-pro/nwa}
+
+\section*{Slide 1 --- Title}
+\begin{itemize}[leftmargin=*]
+  \item Introduce the team: The Starks --- Othmane Zizi, Fares Joni, Tanmay Giri.
+  \item State the project: Predict Customer Lifetime Value using RFM features, regularized regression, and causal inference.
+  \item Point to the GitHub repository for full reproducibility.
+\end{itemize}
+
+\section*{Slide 2 --- Business Context \& Our Approach}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{The Problem}: Not all customers are equal; e-commerce businesses invest equally across their customer base, but a small segment drives the majority of revenue. Without predictive CLV, marketing spend is misallocated.
+  \item \textbf{Our Approach}: Predict $\rightarrow$ Explain $\rightarrow$ Act. Build a regression model on RFM + behavioral features to predict 6-month forward CLV. Use SHAP for explainability, causal inference for treatment effects, and monitoring for production readiness.
+  \item Highlight the four key numbers: 4,266 customers, 1.07M transactions, 8 features, 6-month prediction window.
+\end{itemize}
+
+\section*{Slide 3 --- Research Hypotheses}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{H$_1$ --- Monetary Features Dominate}: Past spending behavior (Monetary, AvgOrderValue) will be the strongest predictor of future CLV, outweighing frequency and recency signals. \textit{Verdict: Confirmed} --- Monetary importance = 2,136.
+  \item \textbf{H$_2$ --- Regularization Improves Generalization}: Regularized models (Lasso, Ridge) will generalize better than tree-based methods due to moderate dimensionality and potential collinearity. \textit{Verdict: Confirmed} --- Lasso $R^2 = 0.81$ vs Random Forest 0.50.
+  \item \textbf{H$_3$ --- High-Frequency $\neq$ High-CLV}: Causal analysis will show that purchase frequency alone does not causally increase CLV; it may reflect selection bias from already-loyal customers. \textit{Verdict: Supported} --- ATE $\approx -0.17$ (log scale).
+\end{itemize}
+
+\section*{Slide 4 --- Data Pipeline}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Source}: UCI Online Retail dataset --- UK e-commerce, 2010--2011; 1,067,371 transaction rows.
+  \item Fields: InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country.
+  \item \textbf{Cleaning steps}: Remove cancelled orders (Invoice starts with `C'), drop null CustomerID rows ($\sim$25\%), filter Quantity $> 0$ and UnitPrice $> 0$, remove outliers beyond 99th percentile.
+  \item \textbf{Result}: 805,549 clean rows $\rightarrow$ 4,266 unique customers. Observation period ending Dec 2010; 6-month prediction window to Jun 2011.
+\end{itemize}
+
+\section*{Slide 5 --- Feature Engineering}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{RFM Core}: Recency (days since last purchase), Frequency (total number of orders), Monetary (total revenue generated).
+  \item \textbf{Behavioral Extensions}: AvgOrderValue (mean spend per order), AvgBasketSize (items per transaction), NumUniqueProducts (product diversity), AvgTimeBetweenPurchases (purchase cadence), Tenure (days as customer).
+  \item Walk through the feature importance bars: Monetary dominates at 2,136, followed by Frequency (681), AvgOrderValue (534), AvgBasketSize (407), NumUniqueProducts (276), Recency (55).
+  \item \textbf{Target variable}: FutureCLV --- sum of customer revenue in the 6-month prediction window (Dec 2010 -- Jun 2011).
+\end{itemize}
+
+\section*{Slide 6 --- Modeling Strategy}
+\begin{itemize}[leftmargin=*]
+  \item Five candidate models: Linear Regression (baseline), Ridge Regression (L2), Lasso Regression (L1, \textbf{best model}), Random Forest (ensemble), Gradient Boosting (ensemble).
+  \item \textbf{Train/Test split}: 80/20 stratified split preserving CLV distribution; all features standardized via StandardScaler.
+  \item \textbf{Cross-validation}: 5-fold CV on training set. Best CV $R^2 = 0.53 \pm 0.18$ (Lasso).
+  \item \textbf{Hyperparameter tuning}: Randomized search over alpha values. Best Lasso $\alpha = 4.90$.
+\end{itemize}
+
+\section*{Slide 7 --- Model Performance}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Winner}: Tuned Lasso Regression --- $R^2 = 0.810$, RMSE = \pounds1,756, MAE = \pounds545, CV $R^2 = 0.53 \pm 0.18$.
+  \item Linear models outperform tree ensembles because the target is dominated by Monetary (a near-linear relationship).
+  \item Walk through the model comparison chart (RMSE/MAE/$R^2$ across all 5 models) and the best model analysis (predicted-vs-actual scatter + residual distribution).
+\end{itemize}
+
+\section*{Slide 8 --- Feature Importance \& SHAP Analysis}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Feature importance}: Shown across all models. Monetary dominates with 3$\times$ the importance of Frequency.
+  \item \textbf{SHAP summary}: Confirms a positive, near-linear relationship --- higher past spending directly predicts higher future CLV.
+  \item \textbf{Key insight}: This explainability is critical for stakeholder trust. Monetary is the clear dominant driver, validating H$_1$.
+\end{itemize}
+
+\section*{Slide 9 --- Lift Chart \& Business Impact}
+\begin{itemize}[leftmargin=*]
+  \item Lift chart shows model-guided targeting dramatically outperforms random selection.
+  \item $5.55\times$ lift at top 10\%: top decile captures 5.5$\times$ more value than random targeting.
+  \item $3.62\times$ at top 20\%: top quintile still highly efficient for campaign targeting.
+  \item $2.76\times$ at top 30\%: nearly 3$\times$ improvement over untargeted outreach.
+  \item $1.83\times$ at top 50\%: model adds value even at broader targeting.
+  \item Business implication: allocating campaign budget to the top two deciles is highly efficient.
+\end{itemize}
+
+\section*{Slide 10 --- Section Divider: Causal Inference}
+\begin{itemize}[leftmargin=*]
+  \item Transition from prediction to causation.
+  \item Motivate: ``We can predict CLV, but does purchase frequency \emph{cause} higher CLV, or is it just correlated?''
+  \item Introduce the three key elements: Treatment (High Frequency), Outcome (Future CLV), Method (Meta-Learners).
+\end{itemize}
+
+\section*{Slide 11 --- Causal Inference Setup}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Treatment}: Binary indicator --- customer is above the median purchase frequency. Simulates a ``loyalty program'' or ``re-engagement'' intervention.
+  \item \textbf{Outcome}: \texttt{log(1 + FutureCLV)} --- log-transformed to handle right-skewed distribution and make treatment effects interpretable on a relative scale.
+  \item \textbf{Controls}: All pre-treatment covariates --- Recency, Monetary, Tenure, AvgOrderValue, AvgBasketSize, NumUniqueProducts, AvgTimeBetweenPurchases.
+  \item \textbf{S-Learner} (LRS Regressor): Single model with treatment as feature. Estimates ATE via counterfactual prediction.
+  \item \textbf{T-Learner} (XGB Regressor): Separate models for treated/control groups. More flexible, captures heterogeneous effects.
+\end{itemize}
+
+\section*{Slide 12 --- Causal Inference Results}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{S-Learner (LRS)}: ATE = $-0.179$, 95\% CI $[-0.378, +0.021]$ --- not statistically significant (CI includes zero).
+  \item \textbf{T-Learner (XGB)}: ATE = $-0.167$, 95\% CI $[-0.258, -0.077]$ --- statistically significant negative effect.
+  \item \textbf{Interpretation}: High purchase frequency does \emph{not} causally increase CLV. The negative ATE ($\sim$$-0.17$ on log scale) suggests that after controlling for confounders, high-frequency buyers may be \textbf{deal-seekers} with lower per-transaction value. Correlation $\neq$ causation.
+  \item CATE distribution shows heterogeneity: different customers respond differently.
+  \item Causal feature importance: Frequency is the top driver of treatment heterogeneity.
+\end{itemize}
+
+\section*{Slide 13 --- Threats to Validity}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Selection Bias in Treatment Assignment}: Frequency is observed, not randomized. The median split may conflate inherently loyal customers with those influenced by external factors. Propensity score matching could help, but unobserved confounders remain.
+  \item \textbf{CV vs Test Gap (0.53 $\rightarrow$ 0.81)}: The gap between cross-validation $R^2$ (0.53) and test $R^2$ (0.81) may indicate a favorable test split or temporal patterns. Additional temporal CV would strengthen confidence.
+  \item \textbf{Single-Geography, Single-Period}: Data comes from one UK retailer in 2010--2011. Generalization to other markets, product categories, or time periods is not guaranteed.
+  \item \textbf{Limited Feature Set}: 8 RFM-based features capture purchase behavior but miss demographics, marketing touchpoints, seasonality, and product affinity --- factors that likely influence CLV.
+\end{itemize}
+
+\section*{Slide 14 --- Monitoring \& Deployment Plan}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Production checks}: Input schema validation, feature range checks, prediction distribution monitoring, latency \& throughput SLAs.
+  \item \textbf{Alert thresholds}: PSI $> 0.1$ (moderate drift, investigate); PSI $> 0.25$ (severe drift, trigger retrain); $R^2$ drop $> 15\%$ (performance degradation, retrain).
+  \item \textbf{Maintenance}: Quarterly scheduled retraining, automated drift-triggered retrain, champion/challenger testing, model versioning \& rollback.
+  \item \textbf{Current status}: All features stable --- max PSI = 0.035. No feature exceeds the 0.1 warning threshold. Model is production-ready.
+\end{itemize}
+
+\section*{Slide 15 --- Key Takeaways \& Thank You}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Takeaway 1}: Lasso achieves $R^2 = 0.81$ --- regularized regression outperforms tree-based models with strong predictive power and interpretability.
+  \item \textbf{Takeaway 2}: $5.55\times$ lift in top decile --- model-driven targeting captures 5$\times$ more value than random selection, direct ROI for marketing spend.
+  \item \textbf{Takeaway 3}: Frequency $\neq$ causal driver --- causal analysis reveals high frequency does not increase CLV, challenging the ``more visits = more value'' assumption.
+  \item \textbf{Takeaway 4}: Production-ready pipeline --- full monitoring with PSI drift detection (all stable at $< 0.035$), automated alerts, and quarterly retraining schedule.
+  \item \textbf{Next steps}: Add temporal cross-validation, integrate product-level features, A/B test targeting strategies, expand to multi-market.
+  \item Close with ``Thank You'' and open for questions.
+\end{itemize}
+
+\end{document}

@@ -43,9 +43,6 @@ data/
 # Reports & figures (in cloud storage)
 reports/
 
-# Deliverables (local only)
-deliverables/
-
 # External project folder
 mma-enterprise-ds/
 

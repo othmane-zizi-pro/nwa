@@ -3,39 +3,18 @@
 Repository: https://github.com/othmane-zizi-pro/nwa
 
 ## Team
-
 | Member | Student ID | GitHub |
 |---|---:|---|
 | Othmane Zizi | 261255341 | `othmane-zizi-pro` |
 | Fares Joni | 261254593 | `FaresJ81` |
 | Tanmay Giri | 261272443 | `tanmaysgiri` |
 
-## Project Goal
+## Project Summary
+End-to-end ML pipeline for 6-month CLV prediction, explainability (feature importance + SHAP), causal inference (CausalML), and monitoring artifacts.
 
-Predict customer 6-month CLV from historical transaction behavior, then support campaign targeting with causal uplift analysis.
-
-This repository includes:
-- Full end-to-end ML pipeline (data acquisition → preparation → modeling → evaluation → explainability → monitoring artifacts)
-- CausalML second phase (`LRSRegressor` + `XGBTRegressor`)
-- SHAP explainability + feature importance
-- Final presentation deliverables (slide deck + LaTeX notes PDF)
-
-## Dataset
-
-**Source:** [UCI Online Retail II Dataset](https://archive.ics.uci.edu/dataset/502/online+retail+ii)
-
-- **Records:** 1,067,371 raw transactions → 805,549 clean rows → 4,266 customers
-- **Time Period:** 2010–2011 (UK-based online giftware retailer)
-- **Observation window:** 12 months (Dec 2009–Dec 2010)
-- **Prediction window:** 6 months (Dec 2010–Jun 2011)
-
-## Project Structure
-
-```
+## Structure
+```text
 nwa/
-├── README.md
-├── LICENSE
-├── requirements.txt
 ├── notebooks/
 │   ├── 01_data_exploration.ipynb
 │   ├── 02_data_cleaning.ipynb
@@ -45,103 +24,88 @@ nwa/
 │   ├── 06_causal_inference.ipynb
 │   └── 07_launch_monitoring.ipynb
 ├── src/
-│   ├── __init__.py
 │   ├── data_loader.py
 │   ├── features.py
 │   ├── models.py
 │   ├── causal.py
 │   └── monitoring.py
 ├── scripts/
-│   ├── run_full_pipeline.py
-│   └── make_deck.py
+│   └── run_full_pipeline.py
 ├── tests/
 │   ├── test_features.py
 │   └── test_monitoring.py
-├── data/                  # (not in repo — see download links below)
-├── reports/               # (not in repo — see download links below)
-└── deliverables/          # (not in repo — local only)
+├── reports/
+├── deliverables/
+│   ├── final_presentation.pptx
+│   ├── repo_link.md
+│   ├── presentation_notes.tex
+│   ├── presentation_notes.pdf
+│   └── requirements_mapping.md
+└── data/
 ```
 
-### Data & Reports (Google Drive)
-
-| Folder | Contents | Link |
-|---|---|---|
-| `data/` | `raw/` and `processed/` subfolders | [Download](https://drive.google.com/drive/folders/1IpYHdcr0yhyyFfacFeV9y2rBTAiKPTsK?usp=drive_link) |
-| `reports/` | Figures, CSVs, model results, pipeline metadata | [Download](https://drive.google.com/drive/folders/11viOzlxh8mnjunGd2BoOGpcWTseAcRz6?usp=drive_link) |
-
-## Methodology
-
-### 1. Data Preparation
-- Remove cancelled orders (Invoice prefix 'C'), null CustomerIDs (~25%), non-positive Quantity/UnitPrice
-- Remove outliers beyond 99th percentile
-- Result: 805,549 clean rows → 4,266 unique customers
-
-### 2. Feature Engineering
-
-| Feature | Description |
-|---|---|
-| Recency | Days since last purchase |
-| Frequency | Total number of orders |
-| Monetary | Total revenue generated |
-| Tenure | Days since first purchase |
-| AvgTimeBetweenPurchases | Purchase cadence |
-| NumUniqueProducts | Product diversity |
-| AvgBasketSize | Items per transaction |
-| AvgOrderValue | Mean spend per order |
-
-**Target:** FutureCLV — total revenue in the 6-month prediction window
-
-### 3. Modeling
-
-| Model | Test R² | RMSE | MAE |
-|---|---:|---:|---:|
-| **Lasso Regression (Tuned)** | **0.810** | **£1,756** | **£545** |
-| Ridge Regression (Tuned) | 0.806 | £1,772 | £548 |
-| Linear Regression | — | — | — |
-| Random Forest | 0.500 | — | — |
-| Gradient Boosting | 0.310 | — | — |
-
-- 5-fold CV R² = 0.53 ± 0.18 (Lasso)
-- Best Lasso α = 4.90 via RandomizedSearchCV
-- Lift@10% = 5.55×, Lift@20% = 3.62×
-
-### 4. Causal Inference
-
-Treatment: high purchase frequency (above median). Outcome: log(1 + FutureCLV).
-
-| Model | ATE (log scale) | 95% CI |
-|---|---:|---|
-| S-Learner (LRS) | −0.179 | [−0.378, +0.021] |
-| T-Learner (XGB) | −0.167 | [−0.258, −0.077] |
-
-**Finding:** High frequency does *not* causally increase CLV — negative ATE suggests deal-seeking behavior after controlling for confounders.
-
-### 5. Monitoring
-
-- PSI drift detection on all 8 features (max PSI = 0.035, all stable)
-- Alert thresholds: PSI > 0.1 (investigate), PSI > 0.25 (retrain)
-- Quarterly scheduled retraining + drift-triggered retrain
-
-## Getting Started
-
+## Setup
 ```bash
-git clone https://github.com/othmane-zizi-pro/nwa.git
-cd nwa
-pip install -r requirements.txt
-
-# Run full pipeline (downloads data automatically)
-python scripts/run_full_pipeline.py
-
-# Generate presentation deck (requires playwright)
-python scripts/make_deck.py
+python3 -m pip install -r requirements.txt
 ```
 
-## References
+## Run End-to-End Pipeline
+```bash
+python3 scripts/run_full_pipeline.py
+```
 
-- [UCI Online Retail II Dataset](https://archive.ics.uci.edu/dataset/502/online+retail+ii)
-- [CLV Prediction Research (ScienceDirect)](https://www.sciencedirect.com/science/article/pii/S2405844023005911)
-- [CLV in B2B SaaS (Springer)](https://link.springer.com/article/10.1057/s41270-023-00234-6)
+This generates:
+- `data/processed/cleaned_retail.csv`
+- `data/processed/customer_features.csv`
+- `data/processed/clv_predictions.csv`
+- `data/processed/customer_segments.csv`
+- `data/processed/causal_dataset.csv`
+- `reports/*.csv`
+- `reports/figures/*.png`
 
-## License
+## Execute All Notebooks (with outputs)
+```bash
+for nb in notebooks/01_data_exploration.ipynb notebooks/02_data_cleaning.ipynb notebooks/03_feature_engineering.ipynb notebooks/04_modeling.ipynb notebooks/05_segmentation.ipynb notebooks/06_causal_inference.ipynb notebooks/07_launch_monitoring.ipynb; do
+  python3 -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 "$nb"
+done
+```
 
-This project is for educational purposes as part of McGill University coursework.
+## Run Tests
+```bash
+python3 -m pytest -q
+```
+
+## External Storage Placeholders (Large Files)
+Replace these links before submission:
+- Raw data folder: `[LINK_TO_RAW_DATA_FOLDER]`
+- Processed data folder: `[LINK_TO_PROCESSED_DATA_FOLDER]`
+- Reports/artifacts folder: `[LINK_TO_REPORTS_FOLDER]`
+
+Upload to storage:
+
+`raw`
+- `data/raw/online_retail_II.xlsx`
+- `data/raw/README_data_source.txt` (source URL + download date + checksum)
+
+`processed`
+- `data/processed/cleaned_retail.csv`
+- `data/processed/customer_features.csv`
+- `data/processed/clv_predictions.csv`
+- `data/processed/customer_segments.csv`
+- `data/processed/causal_dataset.csv`
+
+`reports`
+- `reports/model_results.csv`
+- `reports/cv_results.csv`
+- `reports/feature_importance.csv`
+- `reports/causal_ate_results.csv`
+- `reports/causal_feature_importance.csv`
+- `reports/causal_uplift_predictions.csv`
+- `reports/monitoring_input_drift.csv`
+- `reports/monitoring_plan.md`
+- `reports/figures/` (all generated PNGs)
+
+## Notes
+- SHAP output: `reports/figures/shap_summary.png`
+- Feature importance: `reports/feature_importance.csv` and `reports/figures/feature_importance.png`
+- Causal models required by assignment: `LRSRegressor`, `XGBTRegressor` (see notebook `06`)
