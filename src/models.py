@@ -1,18 +1,29 @@
-"""
-Model training utilities for CLV prediction.
-"""
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Tuple, Any
-from sklearn.model_selection import cross_val_score, TimeSeriesSplit
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+"""Model training utilities for CLV prediction."""
+
+from __future__ import annotations
+
 import warnings
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.stats import randint, uniform
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Lasso, LinearRegression, Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import RandomizedSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBRegressor
+
+    XGBOOST_AVAILABLE = True
+except Exception:  # pragma: no cover - environment-dependent
+    XGBRegressor = None
+    XGBOOST_AVAILABLE = False
 
 
-def get_models() -> Dict[str, Any]:
+def get_models(include_xgboost: bool = True) -> Dict[str, Any]:
     """
     Get dictionary of models to train.
 
@@ -22,20 +33,36 @@ def get_models() -> Dict[str, Any]:
     models = {
         "Linear Regression": LinearRegression(),
         "Ridge Regression": Ridge(alpha=1.0),
+        "Lasso Regression": Lasso(alpha=0.5),
         "Random Forest": RandomForestRegressor(
-            n_estimators=100,
-            max_depth=10,
+            n_estimators=300,
+            max_depth=12,
             min_samples_split=5,
+            min_samples_leaf=2,
             random_state=42,
             n_jobs=-1
         ),
         "Gradient Boosting": GradientBoostingRegressor(
-            n_estimators=100,
-            max_depth=5,
-            learning_rate=0.1,
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
             random_state=42
         )
     }
+
+    if include_xgboost and XGBOOST_AVAILABLE:
+        models["XGBoost"] = XGBRegressor(
+            n_estimators=400,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_lambda=1.0,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=-1,
+        )
+
     return models
 
 
@@ -144,9 +171,9 @@ def get_feature_importance(
         DataFrame with feature importances.
     """
     if hasattr(model, "feature_importances_"):
-        importance = model.feature_importances_
+        importance = np.asarray(model.feature_importances_, dtype=float)
     elif hasattr(model, "coef_"):
-        importance = np.abs(model.coef_)
+        importance = np.abs(np.asarray(model.coef_, dtype=float))
     else:
         return pd.DataFrame()
 
@@ -190,7 +217,9 @@ def cross_validate_model(
 
     # Cross-validation scores
     r2_scores = cross_val_score(model, X_scaled, y, cv=cv, scoring="r2")
-    neg_rmse_scores = cross_val_score(model, X_scaled, y, cv=cv, scoring="neg_root_mean_squared_error")
+    neg_rmse_scores = cross_val_score(
+        model, X_scaled, y, cv=cv, scoring="neg_root_mean_squared_error"
+    )
     neg_mae_scores = cross_val_score(model, X_scaled, y, cv=cv, scoring="neg_mean_absolute_error")
 
     return {
@@ -201,6 +230,75 @@ def cross_validate_model(
         "MAE_mean": -neg_mae_scores.mean(),
         "MAE_std": neg_mae_scores.std()
     }
+
+
+def tune_model(
+    model_name: str,
+    model: Any,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cv: int = 5,
+    n_iter: int = 20,
+    random_state: int = 42,
+) -> Tuple[Any, Dict[str, Any], float]:
+    """
+    Hyperparameter tuning using randomized search.
+
+    Returns:
+        (best_estimator, best_params, best_cv_rmse)
+    """
+    param_distributions: Dict[str, Any]
+
+    if model_name == "Ridge Regression":
+        param_distributions = {"alpha": uniform(0.05, 20.0)}
+    elif model_name == "Lasso Regression":
+        # Avoid near-zero alpha values that behave like unstable OLS on this dataset.
+        param_distributions = {"alpha": uniform(0.05, 5.0)}
+    elif model_name == "Random Forest":
+        param_distributions = {
+            "n_estimators": randint(200, 900),
+            "max_depth": randint(3, 25),
+            "min_samples_split": randint(2, 20),
+            "min_samples_leaf": randint(1, 12),
+            "max_features": ["sqrt", "log2", None],
+        }
+    elif model_name == "Gradient Boosting":
+        param_distributions = {
+            "n_estimators": randint(150, 700),
+            "max_depth": randint(2, 8),
+            "learning_rate": uniform(0.01, 0.2),
+            "subsample": uniform(0.6, 0.4),
+            "min_samples_split": randint(2, 12),
+            "min_samples_leaf": randint(1, 8),
+        }
+    elif model_name == "XGBoost" and XGBOOST_AVAILABLE:
+        param_distributions = {
+            "n_estimators": randint(150, 700),
+            "max_depth": randint(2, 10),
+            "learning_rate": uniform(0.01, 0.2),
+            "subsample": uniform(0.6, 0.4),
+            "colsample_bytree": uniform(0.6, 0.4),
+            "reg_lambda": uniform(0.1, 5.0),
+            "reg_alpha": uniform(0.0, 2.0),
+        }
+    else:
+        # No tuning space available (e.g., plain linear regression).
+        return model, {}, np.nan
+
+    search = RandomizedSearchCV(
+        estimator=model,
+        param_distributions=param_distributions,
+        n_iter=n_iter,
+        scoring="neg_root_mean_squared_error",
+        cv=cv,
+        random_state=random_state,
+        n_jobs=1,
+        verbose=0,
+    )
+    search.fit(X_train, y_train)
+    best_rmse = -float(search.best_score_)
+
+    return search.best_estimator_, search.best_params_, best_rmse
 
 
 def segment_customers_by_clv(
