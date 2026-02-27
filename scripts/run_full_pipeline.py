@@ -224,16 +224,20 @@ def run_pipeline(force_download: bool = False, skip_causal: bool = False) -> Non
     X = dataset[FEATURE_COLS].copy().fillna(0)
     y = dataset["CLV"].astype(float).fillna(0)
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.2, random_state=RANDOM_STATE
     )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=RANDOM_STATE
+    )
+    print(f"Split sizes — train: {len(X_train)}, val: {len(X_val)}, test: {len(X_test)}")
 
     base_models = get_models(include_xgboost=True)
     base_results, trained_models, scaler = train_and_evaluate(
         X_train=X_train,
-        X_test=X_test,
+        X_test=X_val,
         y_train=y_train,
-        y_test=y_test,
+        y_test=y_val,
         models=base_models,
         scale_features=True,
     )
@@ -241,6 +245,9 @@ def run_pipeline(force_download: bool = False, skip_causal: bool = False) -> Non
 
     X_train_scaled = pd.DataFrame(
         scaler.transform(X_train), columns=FEATURE_COLS, index=X_train.index
+    )
+    X_val_scaled = pd.DataFrame(
+        scaler.transform(X_val), columns=FEATURE_COLS, index=X_val.index
     )
     X_test_scaled = pd.DataFrame(
         scaler.transform(X_test), columns=FEATURE_COLS, index=X_test.index
@@ -262,8 +269,8 @@ def run_pipeline(force_download: bool = False, skip_causal: bool = False) -> Non
         if not best_params:
             continue
         tuned_model.fit(X_train_scaled, y_train)
-        tuned_pred = np.clip(tuned_model.predict(X_test_scaled), 0, None)
-        tuned_metrics = evaluate_model(y_test.values, tuned_pred)
+        tuned_pred = np.clip(tuned_model.predict(X_val_scaled), 0, None)
+        tuned_metrics = evaluate_model(y_val.values, tuned_pred)
         tuned_name = f"{model_name} (Tuned)"
         tuned_records.append(
             {

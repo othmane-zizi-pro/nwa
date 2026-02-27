@@ -1,1019 +1,991 @@
 #!/usr/bin/env python3
-"""Generate a beautiful CLV presentation deck.
+"""Build a high-design deck from HTML, then export PDF and editable PPTX.
 
-Creates 15 HTML slides → screenshots via Playwright → PPTX + PDF.
+Outputs in deliverables/:
+- final_presentation.html
+- final_presentation.pdf
+- final_presentation.pptx
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
+import csv
+import html
 import json
+import subprocess
+import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-# ── Paths ───────────────────────────────────────────────────────────────
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt
+
+
 ROOT = Path(__file__).resolve().parent.parent
+DELIVERABLES = ROOT / "deliverables"
 REPORTS = ROOT / "reports"
 FIGURES = REPORTS / "figures"
-DELIVERABLES = ROOT / "deliverables"
-PREVIEWS = DELIVERABLES / "slide_previews"
-PREVIEWS.mkdir(parents=True, exist_ok=True)
+
+HTML_OUT = DELIVERABLES / "final_presentation.html"
+PDF_OUT = DELIVERABLES / "final_presentation.pdf"
+PPTX_OUT = DELIVERABLES / "final_presentation.pptx"
+
+REPO_LINK = "https://github.com/othmane-zizi-pro/nwa"
 
 
-# ── Image helper ────────────────────────────────────────────────────────
-def img_b64(path: Path) -> str:
-    """Return base64 data URI for a PNG image."""
+def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def load_dynamic_metrics() -> Dict[str, str]:
+    metrics = {
+        "best_model": "Lasso Regression (Tuned)",
+        "rmse": "1756.13",
+        "mae": "545.35",
+        "r2": "0.810",
+        "lift_10": "5.55",
+        "max_psi": "0.035",
+        "ate_lrs": "-0.1785",
+        "ate_xgbt": "-0.1673",
+    }
+
+    model_rows = _read_csv_rows(REPORTS / "model_results.csv")
+    if model_rows:
+        top = model_rows[0]
+        metrics["best_model"] = top.get("", top.get("Model", metrics["best_model"]))
+        metrics["rmse"] = f"{float(top.get('RMSE', 0.0)):.2f}"
+        metrics["mae"] = f"{float(top.get('MAE', 0.0)):.2f}"
+        metrics["r2"] = f"{float(top.get('R2', 0.0)):.3f}"
+
+    meta = REPORTS / "pipeline_metadata.json"
+    if meta.exists():
+        payload = json.loads(meta.read_text(encoding="utf-8"))
+        lift_10 = payload.get("lift_stats", {}).get("Lift@10%")
+        if lift_10 is not None:
+            metrics["lift_10"] = f"{float(lift_10):.2f}"
+
+    drift_rows = _read_csv_rows(REPORTS / "monitoring_input_drift.csv")
+    if drift_rows:
+        max_psi = max(float(r.get("PSI", 0.0)) for r in drift_rows)
+        metrics["max_psi"] = f"{max_psi:.3f}"
+
+    causal_rows = _read_csv_rows(REPORTS / "causal_ate_results.csv")
+    by_model = {r.get("Model", ""): r for r in causal_rows}
+    if "LRSRegressor" in by_model:
+        metrics["ate_lrs"] = f"{float(by_model['LRSRegressor']['ATE_log1p']):.4f}"
+    if "XGBTRegressor" in by_model:
+        metrics["ate_xgbt"] = f"{float(by_model['XGBTRegressor']['ATE_log1p']):.4f}"
+
+    return metrics
+
+
+def img_data_uri(path: Path) -> str:
     if not path.exists():
         return ""
-    data = path.read_bytes()
-    encoded = base64.b64encode(data).decode()
-    return f"data:image/png;base64,{encoded}"
+    ext = path.suffix.lower().replace(".", "") or "png"
+    payload = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:image/{ext};base64,{payload}"
 
 
-# ── Base CSS ────────────────────────────────────────────────────────────
-BASE_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+def build_slides(metrics: Dict[str, str]) -> List[Dict[str, object]]:
+    return [
+        {
+            "layout": "hero",
+            "kicker": "INSY 674 Final Project",
+            "title": "Customer Lifetime Value Prediction",
+            "subtitle": (
+                "Predictive modeling, explainability, causal inference, and monitoring "
+                "for an end-to-end enterprise data science workflow."
+            ),
+            "footer": (
+                "Othmane Zizi (261255341) | Fares Joni (261254593) | "
+                "Tanmay Giri (261272443) | " + REPO_LINK
+            ),
+        },
+        {
+            "layout": "split",
+            "kicker": "Context",
+            "title": "Business Context and Objective (5.9.1)",
+            "left_title": "Problem",
+            "left_bullets": [
+                "Marketing budgets are often distributed uniformly across unequal customers.",
+                "High-value customers can churn without proactive intervention.",
+                "Revenue concentration means ranking quality drives business impact.",
+            ],
+            "right_title": "Objective",
+            "right_bullets": [
+                "Predict 6-month CLV per customer from historical transaction behavior.",
+                "Use model output to prioritize retention and campaign spend.",
+                "Track value capture with lift and production monitoring.",
+            ],
+        },
+        {
+            "layout": "bullets",
+            "kicker": "Hypothesis",
+            "title": "Hypotheses and Testing Framing (5.9.2)",
+            "bullets": [
+                "H1: RFM + behavioral features can predict future CLV.",
+                "H2: Regularized linear models generalize better than tree models on this feature set.",
+                "H3: Causal uplift analysis identifies who should receive treatment.",
+                "Null framing: treatment has no measurable effect on log1p(CLV).",
+            ],
+        },
+        {
+            "layout": "gallery",
+            "kicker": "EDA",
+            "title": "Exploration Visuals: Coverage and Quality (5.3)",
+            "summary": [
+                "Initial EDA covered time trends, missingness, geography, and transactional behavior.",
+                "These checks informed cleaning decisions before feature engineering.",
+            ],
+            "images": [
+                {"path": FIGURES / "daily_transactions.png", "caption": "Daily transaction volume"},
+                {"path": FIGURES / "missing_values.png", "caption": "Missing values profile"},
+                {"path": FIGURES / "top_countries.png", "caption": "Top purchasing countries"},
+                {"path": FIGURES / "price_quantity_dist.png", "caption": "Price and quantity distribution"},
+            ],
+        },
+        {
+            "layout": "gallery",
+            "kicker": "Features",
+            "title": "Feature and Target Distributions (5.4)",
+            "summary": [
+                "RFM and behavioral features show heavy skew and strong concentration effects.",
+                "Correlation and distribution checks shaped model family and scaling decisions.",
+            ],
+            "images": [
+                {"path": FIGURES / "rfm_distributions.png", "caption": "RFM feature distributions"},
+                {"path": FIGURES / "clv_distribution.png", "caption": "Future CLV distribution"},
+                {"path": FIGURES / "customer_frequency.png", "caption": "Customer purchase frequency"},
+                {"path": FIGURES / "correlation_matrix.png", "caption": "Feature correlation matrix"},
+            ],
+        },
+        {
+            "layout": "gallery",
+            "kicker": "Segmentation",
+            "title": "Segmentation and Behavioral Clusters",
+            "summary": [
+                "Segmentation complements prediction by converting scores into action buckets.",
+                "Profiles and cluster diagnostics guide campaign strategy design.",
+            ],
+            "images": [
+                {"path": FIGURES / "segment_distribution.png", "caption": "Segment size distribution"},
+                {"path": FIGURES / "segment_profiles.png", "caption": "Segment profile comparison"},
+                {"path": FIGURES / "rfm_segments.png", "caption": "RFM segment map"},
+                {"path": FIGURES / "elbow_method.png", "caption": "K-means elbow method"},
+            ],
+        },
+        {
+            "layout": "bullets",
+            "kicker": "Modeling",
+            "title": "Modeling Approach and Evaluation (5.5, 5.6)",
+            "bullets": [
+                "Train/val/test split: 80/10/10 at customer level; validation for tuning, test as final holdout.",
+                "Compared Linear, Ridge, Lasso, Random Forest, Gradient Boosting, XGBoost.",
+                "Metrics: RMSE, MAE, R2, MAPE and lift for business prioritization.",
+                "Randomized search used for fine-tuning top candidates.",
+            ],
+        },
+        {
+            "layout": "table",
+            "kicker": "Results",
+            "title": "Predictive Performance (5.9.5)",
+            "headers": ["Model", "RMSE", "MAE", "R2"],
+            "rows": [
+                [metrics["best_model"], metrics["rmse"], metrics["mae"], metrics["r2"]],
+                ["Lasso Regression", "1761.83", "547.71", "0.808"],
+                ["Linear Regression", "1762.46", "547.99", "0.808"],
+                ["Ridge Regression", "1762.94", "547.98", "0.808"],
+                ["XGBoost", "2387.82", "534.66", "0.648"],
+            ],
+        },
+        {
+            "layout": "gallery",
+            "kicker": "Model Diagnostics",
+            "title": "Diagnostics and Business Utility (5.7, 5.8, 5.9.6)",
+            "summary": [
+                "Model ranking, residual diagnostics, and lift all support selection of a tuned regularized model.",
+                "The top-decile lift demonstrates strong practical targeting value.",
+            ],
+            "images": [
+                {"path": FIGURES / "model_comparison.png", "caption": "Model metric comparison"},
+                {"path": FIGURES / "feature_importance.png", "caption": "Global feature importance"},
+                {"path": FIGURES / "best_model_analysis.png", "caption": "Residual and fit diagnostics"},
+                {"path": FIGURES / "lift_chart.png", "caption": "Lift chart (business impact)"},
+            ],
+        },
+        {
+            "layout": "bullets_with_image",
+            "kicker": "Explainability",
+            "title": "SHAP Explainability (5.9.6)",
+            "bullets": [
+                "SHAP confirms direction and magnitude of global drivers.",
+                "Monetary and frequency behavior dominate prediction contributions.",
+                "Interpretability supports stakeholder trust and campaign governance.",
+                "Lift@10% = " + metrics["lift_10"] + "x over random targeting.",
+            ],
+            "image": FIGURES / "shap_summary.png",
+        },
+        {
+            "layout": "section",
+            "kicker": "Phase 2",
+            "title": "CausalML Phase",
+            "subtitle": "From prediction to intervention impact estimation",
+        },
+        {
+            "layout": "split",
+            "kicker": "Causal Setup",
+            "title": "Target, Treatment, Controls",
+            "left_title": "Definitions",
+            "left_bullets": [
+                "Outcome: log1p(CLV).",
+                "Treatment: campaign vs control assignment.",
+                "Controls: RFM + behavioral features.",
+            ],
+            "right_title": "Required Methods",
+            "right_bullets": [
+                "LRSRegressor (S-learner style).",
+                "XGBTRegressor (T-learner style).",
+                "Feature importance and CATE distribution analyzed in notebook 06.",
+            ],
+        },
+        {
+            "layout": "table",
+            "kicker": "Causal Results",
+            "title": "Average Treatment Effects",
+            "headers": ["Model", "ATE (log1p CLV)", "CI Lower", "CI Upper"],
+            "rows": [
+                ["LRSRegressor", metrics["ate_lrs"], "-0.3783", "0.0213"],
+                ["XGBTRegressor", metrics["ate_xgbt"], "-0.2575", "-0.0770"],
+            ],
+        },
+        {
+            "layout": "gallery",
+            "kicker": "Causal Explainability",
+            "title": "Uplift Distribution and Causal Importance",
+            "summary": [
+                "Treatment effects vary substantially by customer profile (heterogeneous CATE).",
+                "Causal importance supports policy targeting beyond raw CLV ranking.",
+            ],
+            "images": [
+                {"path": REPORTS / "causal_cate_distribution.png", "caption": "CATE distribution"},
+                {"path": REPORTS / "causal_feature_importance.png", "caption": "Causal feature importance"},
+            ],
+        },
+        {
+            "layout": "bullets",
+            "kicker": "Validity",
+            "title": "Threats to Validity (5.9.7)",
+            "bullets": [
+                "Treatment assignment is observational/simulated, not randomized.",
+                "Potential unobserved confounding and temporal effects.",
+                "Outliers and historical policy effects can bias relationships.",
+                "External validity may differ across geographies and verticals.",
+            ],
+        },
+        {
+            "layout": "bullets_with_image",
+            "kicker": "MLOps",
+            "title": "Launching, Monitoring, Maintenance (5.10)",
+            "bullets": [
+                "Production checks: schema validation, feature quality checks, artifact versioning.",
+                "Monitoring: RMSE drift, CLV capture@K, feature drift via PSI.",
+                "Alerting: warning at PSI >= 0.10, critical at PSI >= 0.25.",
+                "Observed max PSI in validation run: " + metrics["max_psi"] + " (stable).",
+            ],
+            "image": FIGURES / "segment_dashboard.png",
+        },
+        {
+            "layout": "bullets",
+            "kicker": "Conclusion",
+            "title": "Conclusions, Lessons, and Next Steps (5.9.8, 5.9.9)",
+            "bullets": [
+                "An end-to-end enterprise DS pipeline was implemented and validated.",
+                "Predictive + explainable + causal layers improve decision quality.",
+                "Next step: validate uplift on real campaign logs / A/B tests.",
+                "This repository is submission-ready with reproducible artifacts.",
+            ],
+        },
+        {
+            "layout": "hero",
+            "kicker": "Thank You",
+            "title": "Questions and Discussion",
+            "subtitle": (
+                "Repository: " + REPO_LINK + "\n"
+                "Othmane Zizi (261255341) | Fares Joni (261254593) | "
+                "Tanmay Giri (261272443)"
+            ),
+            "footer": "Nerds With Attitude - INSY 674",
+        },
+    ]
 
-*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-html, body {
-    width: 1920px;
-    height: 1080px;
-    overflow: hidden;
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    color: #0F172A;
-    -webkit-font-smoothing: antialiased;
+HTML_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Sans+3:wght@400;600;700&display=swap');
+
+:root{
+  --ink:#0c1821;
+  --ink-2:#1b2a41;
+  --sky:#00a8e8;
+  --mint:#2ec4b6;
+  --sun:#ffb703;
+  --sand:#f8f5f1;
+  --paper:#ffffff;
+  --muted:#6b7280;
 }
-
-body {
-    display: flex;
-    flex-direction: column;
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:#0b1220}
+body{font-family:'Source Sans 3',system-ui,sans-serif}
+@page { size: 13.333in 7.5in; margin: 0; }
+.slide{
+  width:13.333in;height:7.5in;position:relative;overflow:hidden;
+  page-break-after:always;background:var(--sand);color:var(--ink);
 }
-
-.slide-dark {
-    background: linear-gradient(135deg, #0A1628 0%, #0F2847 50%, #0A1628 100%);
-    color: #F8FAFC;
-    padding: 72px 96px;
+.slide::before{
+  content:"";position:absolute;right:-1.2in;top:-1.1in;width:3in;height:3in;border-radius:50%;
+  background:radial-gradient(circle at 30% 30%, rgba(46,196,182,.32), rgba(46,196,182,.06));
 }
-
-.slide-light {
-    background: #F8FAFC;
-    padding: 72px 96px;
+.slide::after{
+  content:"";position:absolute;left:-1.4in;bottom:-1.4in;width:3.2in;height:3.2in;border-radius:50%;
+  background:radial-gradient(circle at 65% 60%, rgba(0,168,232,.24), rgba(0,168,232,.02));
 }
-
-.section-tag {
-    display: inline-block;
-    background: rgba(26, 115, 232, 0.1);
-    color: #1A73E8;
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    padding: 6px 18px;
-    border-radius: 100px;
-    margin-bottom: 16px;
+.hero{background:linear-gradient(135deg,#0c1821,#1b2a41);color:#f8fbff}
+.hero .kicker,.hero .subtitle,.hero .footer{color:#d6e7f5}
+.section{background:linear-gradient(120deg,#102539,#1b2a41);color:#f8fbff}
+.wrap{position:relative;z-index:2;padding:.62in .72in .54in .72in;height:100%;display:flex;flex-direction:column}
+.kicker{font-family:'Space Grotesk',sans-serif;font-size:13px;letter-spacing:2px;text-transform:uppercase;color:#236f96;font-weight:700}
+.title{font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:44px;line-height:1.08;margin:10px 0 8px 0}
+.subtitle{font-size:20px;color:#4b5563;line-height:1.35;margin:0 0 18px 0;max-width:11in;white-space:pre-line}
+.footer{margin-top:auto;font-size:15px;color:#374151}
+.cards2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:6px}
+.card{
+  background:linear-gradient(165deg, rgba(255,255,255,.97), rgba(248,252,255,.95));
+  border:1px solid rgba(0,0,0,.08);
+  border-radius:16px;padding:18px 18px 14px 18px;box-shadow:0 10px 24px rgba(10,20,40,.09)
 }
-
-.section-tag-dark {
-    background: rgba(26, 115, 232, 0.25);
-    color: #60A5FA;
+.card h3{margin:0 0 8px 0;font-family:'Space Grotesk',sans-serif;font-size:24px}
+.list{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px}
+.list li{font-size:21px;line-height:1.28;display:flex;gap:10px}
+.dot{color:var(--sky);font-weight:700}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:8px 0 12px}
+.stat{
+  background:linear-gradient(160deg,#ffffff,#f2f8fd);
+  border-radius:14px;border:1px solid rgba(0,0,0,.05);padding:14px 14px 10px;
 }
-
-.slide-title {
-    font-size: 44px;
-    font-weight: 800;
-    line-height: 1.15;
-    margin-bottom: 8px;
+.stat .v{font-family:'Space Grotesk',sans-serif;font-size:34px;font-weight:700;color:#0c516b}
+.stat .l{font-size:12px;text-transform:uppercase;letter-spacing:1.2px;color:#4b5563}
+.split{display:grid;grid-template-columns:1.15fr .85fr;gap:16px;align-items:stretch}
+.image{
+  width:100%;height:4.45in;object-fit:contain;background:#fff;
+  border-radius:14px;border:1px solid rgba(0,0,0,.08);box-shadow:0 12px 30px rgba(2,8,20,.12)
 }
-
-.slide-subtitle {
-    font-size: 18px;
-    font-weight: 400;
-    color: #475569;
-    margin-bottom: 40px;
+.summary{gap:6px;margin:4px 0 8px}
+.summary li{font-size:16px;line-height:1.22}
+.gallery-grid{display:grid;gap:10px;flex:1;align-content:start;min-height:0}
+.gallery-grid.grid-2{grid-template-columns:repeat(2,1fr)}
+.gallery-grid.grid-4{grid-template-columns:repeat(2,1fr)}
+.gallery-grid.grid-5{grid-template-columns:repeat(3,1fr)}
+.gallery-grid.grid-5 .panel:nth-child(4){grid-column:1 / 2}
+.gallery-grid.grid-5 .panel:nth-child(5){grid-column:2 / 4}
+.panel{
+  margin:0;background:#fff;border:1px solid rgba(0,0,0,.08);border-radius:12px;
+  padding:6px 6px 8px;display:flex;flex-direction:column;min-height:0;box-shadow:0 8px 22px rgba(2,8,20,.08)
 }
-
-.card {
-    background: #FFFFFF;
-    border-radius: 16px;
-    padding: 32px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04);
+.gallery-img{width:100%;object-fit:contain;background:#fff;border-radius:8px;border:1px solid rgba(0,0,0,.08)}
+.grid-2 .gallery-img{height:3.05in}
+.grid-4 .gallery-img{height:1.78in}
+.grid-5 .gallery-img{height:1.32in}
+.panel figcaption{margin-top:5px;font-size:12px;line-height:1.2;color:#334155;text-align:center}
+.image-missing{
+  width:100%;height:1.4in;border-radius:8px;border:1px dashed rgba(100,116,139,.8);
+  color:#475569;font-size:12px;display:flex;align-items:center;justify-content:center;background:#f8fafc
 }
-
-.card-accent-top { border-top: 4px solid #1A73E8; }
-.card-accent-left { border-left: 4px solid #1A73E8; }
-
-.metric-card {
-    background: #FFFFFF;
-    border-radius: 12px;
-    padding: 24px 28px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04);
-    border-top: 4px solid #1A73E8;
-}
-
-.metric-value {
-    font-size: 36px;
-    font-weight: 800;
-    color: #0F172A;
-    line-height: 1.1;
-}
-
-.metric-label {
-    font-size: 13px;
-    font-weight: 600;
-    color: #475569;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-top: 8px;
-}
-
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; }
-.grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 24px; }
-
-.chart-img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    border-radius: 12px;
-}
-
-.banner {
-    background: linear-gradient(135deg, #0A1628, #0F2847);
-    color: #F8FAFC;
-    border-radius: 12px;
-    padding: 20px 32px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-}
+table{width:100%;border-collapse:collapse;font-size:20px;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 8px 24px rgba(2,8,20,.08)}
+th,td{padding:12px 14px;border-bottom:1px solid #edf2f7;text-align:left}
+th{font-family:'Space Grotesk',sans-serif;background:#102b40;color:#f8fbff;font-size:16px;text-transform:uppercase;letter-spacing:1.2px}
+tr:nth-child(even) td{background:#f9fcff}
+tr:last-child td{border-bottom:none}
+.animate{animation:rise .5s ease-out}
+@keyframes rise{from{transform:translateY(8px);opacity:.2}to{transform:translateY(0);opacity:1}}
 """
 
 
-def wrap_slide(body_html: str, dark: bool = False) -> str:
-    """Wrap slide body HTML in full HTML document."""
-    body_class = "slide-dark" if dark else "slide-light"
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><style>{BASE_CSS}</style></head>
-<body class="{body_class}">
-{body_html}
-</body></html>"""
+def _list_items(items: List[str]) -> str:
+    return "".join(
+        f"<li><span class='dot'>&bull;</span><span>{html.escape(item)}</span></li>" for item in items
+    )
 
 
-# ── Slide 1: Title ──────────────────────────────────────────────────────
-def slide_01_title():
-    return wrap_slide("""
-<div style="display:flex; flex-direction:column; height:100%; justify-content:center; align-items:center; text-align:center;">
-    <div class="section-tag section-tag-dark" style="margin-bottom:32px;">Enterprise Data Science</div>
-    <h1 style="font-size:72px; font-weight:900; line-height:1.05; max-width:1200px; margin-bottom:24px;
-        background: linear-gradient(135deg, #FFFFFF 0%, #94C4FF 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-        Customer Lifetime Value<br>Prediction
-    </h1>
-    <p style="font-size:22px; font-weight:300; color:rgba(248,250,252,0.5); margin-bottom:56px; max-width:700px;">
-        A data-driven approach to quantifying future customer value using RFM features, regularized regression, and causal inference
-    </p>
-    <div style="display:flex; gap:40px; align-items:center; margin-bottom:48px;">
-        <div style="text-align:center;">
-            <div style="font-weight:600; font-size:16px;">Othmane Zizi</div>
-            <div style="font-size:13px; color:rgba(248,250,252,0.4);">261255341</div>
-        </div>
-        <div style="text-align:center;">
-            <div style="font-weight:600; font-size:16px;">Fares Joni</div>
-            <div style="font-size:13px; color:rgba(248,250,252,0.4);">261254593</div>
-        </div>
-        <div style="text-align:center;">
-            <div style="font-weight:600; font-size:16px;">Tanmay Giri</div>
-            <div style="font-size:13px; color:rgba(248,250,252,0.4);">261272443</div>
-        </div>
+def _image_specs(slide: Dict[str, object]) -> List[Dict[str, object]]:
+    specs: List[Dict[str, object]] = []
+    for item in list(slide.get("images", [])):
+        if isinstance(item, dict):
+            path = Path(str(item.get("path", "")))
+            caption = str(item.get("caption", path.name))
+        else:
+            path = Path(str(item))
+            caption = path.stem.replace("_", " ").title()
+        specs.append({"path": path, "caption": caption})
+    return specs
+
+
+def render_slide_html(slide: Dict[str, object]) -> str:
+    layout = str(slide.get("layout"))
+    kicker = html.escape(str(slide.get("kicker", "")))
+    title = html.escape(str(slide.get("title", "")))
+    subtitle = html.escape(str(slide.get("subtitle", "")))
+
+    if layout == "hero":
+        return f"""
+<section class="slide hero animate">
+  <div class="wrap" style="justify-content:center;text-align:center;">
+    <div class="kicker">{kicker}</div>
+    <h1 class="title" style="font-size:64px;max-width:11.8in;margin:14px auto 12px;">{title}</h1>
+    <p class="subtitle" style="margin:0 auto 24px;max-width:10.2in;color:#dcebf6">{subtitle}</p>
+    <div class="footer" style="color:#dcebf6">{html.escape(str(slide.get("footer", "")))}</div>
+  </div>
+</section>
+"""
+
+    if layout == "section":
+        return f"""
+<section class="slide section animate">
+  <div class="wrap" style="justify-content:center;align-items:center;text-align:center;">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title" style="font-size:62px;max-width:10.8in">{title}</h2>
+    <p class="subtitle" style="color:#dcebf6">{subtitle}</p>
+  </div>
+</section>
+"""
+
+    if layout == "split":
+        left_title = html.escape(str(slide.get("left_title", "")))
+        right_title = html.escape(str(slide.get("right_title", "")))
+        left_items = _list_items(list(slide.get("left_bullets", [])))
+        right_items = _list_items(list(slide.get("right_bullets", [])))
+        return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    <div class="cards2" style="margin-top:14px;">
+      <article class="card"><h3>{left_title}</h3><ul class="list">{left_items}</ul></article>
+      <article class="card"><h3>{right_title}</h3><ul class="list">{right_items}</ul></article>
     </div>
-    <div style="display:flex; align-items:center; gap:10px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:10px 20px;">
-        <svg width="18" height="18" viewBox="0 0 16 16" fill="rgba(248,250,252,0.5)"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span style="font-size:14px; color:rgba(248,250,252,0.5); font-weight:500;">github.com/othmane-zizi-pro/nwa</span>
+  </div>
+</section>
+"""
+
+    if layout == "stats":
+        stats_html = ""
+        for label, value in list(slide.get("stats", [])):
+            stats_html += (
+                "<div class='stat'>"
+                f"<div class='v'>{html.escape(str(value))}</div>"
+                f"<div class='l'>{html.escape(str(label))}</div>"
+                "</div>"
+            )
+        return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    <div class="stats">{stats_html}</div>
+    <ul class="list">{_list_items(list(slide.get("bullets", [])))}</ul>
+  </div>
+</section>
+"""
+
+    if layout == "table":
+        headers = list(slide.get("headers", []))
+        rows = list(slide.get("rows", []))
+        thead = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
+        body = ""
+        for row in rows:
+            body += "<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in row) + "</tr>"
+        return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    <table><thead><tr>{thead}</tr></thead><tbody>{body}</tbody></table>
+  </div>
+</section>
+"""
+
+    if layout == "gallery":
+        summary = list(slide.get("summary", []))
+        summary_html = ""
+        if summary:
+            summary_html = f"<ul class='list summary'>{_list_items([str(x) for x in summary])}</ul>"
+
+        images = _image_specs(slide)
+        count = len(images)
+        grid_class = "grid-2" if count <= 2 else ("grid-5" if count == 5 else "grid-4")
+        panels = ""
+        for spec in images:
+            path = Path(str(spec["path"]))
+            caption = html.escape(str(spec["caption"]))
+            uri = img_data_uri(path)
+            if uri:
+                body = f"<img class='gallery-img' src='{uri}' alt='{caption}' />"
+            else:
+                body = f"<div class='image-missing'>Missing: {html.escape(path.name)}</div>"
+            panels += f"<figure class='panel'>{body}<figcaption>{caption}</figcaption></figure>"
+        return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    {summary_html}
+    <div class="gallery-grid {grid_class}">{panels}</div>
+  </div>
+</section>
+"""
+
+    if layout == "bullets_with_image":
+        image_path = Path(str(slide.get("image", "")))
+        uri = img_data_uri(image_path)
+        return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    <div class="split">
+      <ul class="list">{_list_items(list(slide.get("bullets", [])))}</ul>
+      <img class="image" src="{uri}" />
     </div>
-</div>
-""", dark=True)
+  </div>
+</section>
+"""
+
+    # Default bullets layout.
+    return f"""
+<section class="slide animate">
+  <div class="wrap">
+    <div class="kicker">{kicker}</div>
+    <h2 class="title">{title}</h2>
+    <ul class="list">{_list_items(list(slide.get("bullets", [])))}</ul>
+  </div>
+</section>
+"""
 
 
-# ── Slide 2: Context ────────────────────────────────────────────────────
-def slide_02_context():
-    return wrap_slide("""
-<div class="section-tag">Context</div>
-<h2 class="slide-title">Business Context &amp; Our Approach</h2>
-<p class="slide-subtitle">Understanding customer value is critical for resource allocation and retention strategy</p>
-
-<div class="grid-2" style="flex:1; margin-bottom:24px;">
-    <div class="card card-accent-top">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">The Problem</div>
-        <div style="font-size:18px; font-weight:600; margin-bottom:12px;">Not all customers are equal</div>
-        <p style="font-size:15px; color:#475569; line-height:1.7;">
-            E-commerce businesses invest equally across their customer base, but a small segment drives the majority of revenue.
-            Without predictive CLV, marketing spend is misallocated and high-value customers may churn unnoticed.
-        </p>
-    </div>
-    <div class="card" style="border-top: 4px solid #00C9A7;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Our Approach</div>
-        <div style="font-size:18px; font-weight:600; margin-bottom:12px;">Predict &rarr; Explain &rarr; Act</div>
-        <p style="font-size:15px; color:#475569; line-height:1.7;">
-            Build a regression model on RFM + behavioral features to predict 6-month forward CLV.
-            Use SHAP for explainability, causal inference for treatment effects, and monitoring for production readiness.
-        </p>
-    </div>
-</div>
-
-<div class="grid-4">
-    <div class="metric-card">
-        <div class="metric-value" style="color:#1A73E8;">4,266</div>
-        <div class="metric-label">Customers</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#00C9A7;">
-        <div class="metric-value" style="color:#00C9A7;">1.07M</div>
-        <div class="metric-label">Transactions</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#F59E0B;">
-        <div class="metric-value" style="color:#F59E0B;">8</div>
-        <div class="metric-label">Features</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#6366F1;">
-        <div class="metric-value" style="color:#6366F1;">6 Mo</div>
-        <div class="metric-label">Prediction Window</div>
-    </div>
-</div>
-""")
+def render_html(slides: List[Dict[str, object]]) -> str:
+    sections = "\n".join(render_slide_html(s) for s in slides)
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<style>{HTML_CSS}</style></head><body>{sections}</body></html>"
+    )
 
 
-# ── Slide 3: Hypotheses ─────────────────────────────────────────────────
-def slide_03_hypotheses():
-    return wrap_slide("""
-<div class="section-tag">Hypotheses</div>
-<h2 class="slide-title">Research Hypotheses</h2>
-<p class="slide-subtitle">Three testable hypotheses guiding our analysis</p>
-
-<div class="grid-3" style="flex:1;">
-    <div class="card" style="border-top: 4px solid #1A73E8; display:flex; flex-direction:column;">
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:20px;">
-            <div style="width:48px; height:48px; border-radius:50%; background:linear-gradient(135deg, #1A73E8, #3B82F6); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:18px; color:white; flex-shrink:0;">H1</div>
-            <div style="font-size:17px; font-weight:700;">Monetary Features Dominate</div>
-        </div>
-        <p style="font-size:15px; color:#475569; line-height:1.7; flex:1;">
-            Past spending behavior (Monetary, AvgOrderValue) will be the strongest predictor of future CLV, outweighing frequency and recency signals.
-        </p>
-        <div style="margin-top:20px; padding:12px 16px; background:rgba(26,115,232,0.06); border-radius:8px;">
-            <span style="font-size:13px; font-weight:600; color:#1A73E8;">Verdict: Confirmed</span>
-            <span style="font-size:13px; color:#475569;"> &mdash; Monetary importance = 2,136</span>
-        </div>
-    </div>
-    <div class="card" style="border-top: 4px solid #00C9A7; display:flex; flex-direction:column;">
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:20px;">
-            <div style="width:48px; height:48px; border-radius:50%; background:linear-gradient(135deg, #00C9A7, #34D399); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:18px; color:white; flex-shrink:0;">H2</div>
-            <div style="font-size:17px; font-weight:700;">Regularization Improves Generalization</div>
-        </div>
-        <p style="font-size:15px; color:#475569; line-height:1.7; flex:1;">
-            Regularized models (Lasso, Ridge) will generalize better than tree-based methods on this dataset due to moderate dimensionality and potential collinearity.
-        </p>
-        <div style="margin-top:20px; padding:12px 16px; background:rgba(0,201,167,0.06); border-radius:8px;">
-            <span style="font-size:13px; font-weight:600; color:#00C9A7;">Verdict: Confirmed</span>
-            <span style="font-size:13px; color:#475569;"> &mdash; Lasso R&sup2; = 0.81 vs RF 0.50</span>
-        </div>
-    </div>
-    <div class="card" style="border-top: 4px solid #F59E0B; display:flex; flex-direction:column;">
-        <div style="display:flex; align-items:center; gap:14px; margin-bottom:20px;">
-            <div style="width:48px; height:48px; border-radius:50%; background:linear-gradient(135deg, #F59E0B, #FBBF24); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:18px; color:white; flex-shrink:0;">H3</div>
-            <div style="font-size:17px; font-weight:700;">High-Frequency &ne; High-CLV</div>
-        </div>
-        <p style="font-size:15px; color:#475569; line-height:1.7; flex:1;">
-            Causal analysis will show that purchase frequency alone does not causally increase CLV; instead, it may reflect selection bias from already-loyal customers.
-        </p>
-        <div style="margin-top:20px; padding:12px 16px; background:rgba(245,158,11,0.06); border-radius:8px;">
-            <span style="font-size:13px; font-weight:600; color:#F59E0B;">Verdict: Supported</span>
-            <span style="font-size:13px; color:#475569;"> &mdash; ATE &asymp; &minus;0.17 (log scale)</span>
-        </div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 4: Data ───────────────────────────────────────────────────────
-def slide_04_data():
-    return wrap_slide("""
-<div class="section-tag">Data</div>
-<h2 class="slide-title">Data Pipeline</h2>
-<p class="slide-subtitle">UCI Online Retail dataset &mdash; from raw transactions to clean customer-level features</p>
-
-<div class="grid-2" style="margin-bottom:24px;">
-    <div class="card card-accent-top">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px;">Source</div>
-        <ul style="font-size:15px; color:#475569; line-height:2.2; list-style:none;">
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#1A73E8; font-size:18px;">&#x2022;</span> UCI Online Retail (UK e-commerce, 2010&ndash;2011)
-            </li>
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#1A73E8; font-size:18px;">&#x2022;</span> 1,067,371 transaction rows
-            </li>
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#1A73E8; font-size:18px;">&#x2022;</span> Fields: InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country
-            </li>
-        </ul>
-    </div>
-    <div class="card" style="border-top: 4px solid #00C9A7;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px;">Cleaning Steps</div>
-        <ul style="font-size:15px; color:#475569; line-height:2.2; list-style:none;">
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#00C9A7; font-size:18px;">&#x2022;</span> Remove cancelled orders (Invoice starts with &lsquo;C&rsquo;)
-            </li>
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#00C9A7; font-size:18px;">&#x2022;</span> Drop null CustomerID rows (~25%)
-            </li>
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#00C9A7; font-size:18px;">&#x2022;</span> Filter Quantity &gt; 0, UnitPrice &gt; 0
-            </li>
-            <li style="display:flex; align-items:center; gap:10px;">
-                <span style="color:#00C9A7; font-size:18px;">&#x2022;</span> Remove outliers beyond 99th percentile
-            </li>
-        </ul>
-    </div>
-</div>
-
-<div class="banner">
-    <div style="width:44px; height:44px; border-radius:12px; background:rgba(0,201,167,0.15); display:flex; align-items:center; justify-content:center;">
-        <span style="color:#00C9A7; font-size:22px; font-weight:800;">&check;</span>
-    </div>
-    <div>
-        <div style="font-size:18px; font-weight:700;">805,549 clean rows &rarr; 4,266 unique customers</div>
-        <div style="font-size:14px; color:rgba(248,250,252,0.5);">24.5% rows removed during cleaning &bull; observation period ending Dec 2010 &bull; 6-month prediction window to Jun 2011</div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 5: Features ───────────────────────────────────────────────────
-def slide_05_features():
-    return wrap_slide("""
-<div class="section-tag">Features</div>
-<h2 class="slide-title">Feature Engineering</h2>
-<p class="slide-subtitle">RFM-based features augmented with behavioral signals</p>
-
-<div style="display:flex; gap:24px; flex:1;">
-    <div style="flex:1; display:flex; flex-direction:column; gap:16px;">
-        <div class="card" style="padding:24px; display:flex; flex-direction:column; gap:14px; flex:1;">
-            <div style="font-size:14px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">Feature Importance (Lasso)</div>
-
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">Monetary</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:100%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">2,136</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">Frequency</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:31.9%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">681</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">AvgOrderValue</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:25%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">534</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">AvgBasketSize</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:19%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">407</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">NumUniqueProducts</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:12.9%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">276</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px;">
-                <div style="width:180px; font-size:14px; font-weight:600; color:#0F172A;">Recency</div>
-                <div style="flex:1; height:28px; background:#EEF2FF; border-radius:6px; overflow:hidden;">
-                    <div style="width:2.6%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:6px;"></div>
-                </div>
-                <div style="width:60px; text-align:right; font-size:14px; font-weight:700; color:#1A73E8;">55</div>
-            </div>
-        </div>
-    </div>
-
-    <div style="flex:1; display:flex; flex-direction:column; gap:16px;">
-        <div class="card" style="border-top: 4px solid #1A73E8; flex:1;">
-            <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">RFM Core</div>
-            <p style="font-size:15px; color:#475569; line-height:1.8;">
-                <strong>Recency</strong> &mdash; days since last purchase<br>
-                <strong>Frequency</strong> &mdash; total number of orders<br>
-                <strong>Monetary</strong> &mdash; total revenue generated
-            </p>
-        </div>
-        <div class="card" style="border-top: 4px solid #00C9A7; flex:1;">
-            <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Behavioral Extensions</div>
-            <p style="font-size:15px; color:#475569; line-height:1.8;">
-                <strong>AvgOrderValue</strong> &mdash; mean spend per order<br>
-                <strong>AvgBasketSize</strong> &mdash; items per transaction<br>
-                <strong>NumUniqueProducts</strong> &mdash; product diversity<br>
-                <strong>AvgTimeBetweenPurchases</strong> &mdash; purchase cadence<br>
-                <strong>Tenure</strong> &mdash; days as customer
-            </p>
-        </div>
-    </div>
-</div>
-
-<div class="banner" style="margin-top:24px; background:linear-gradient(135deg, #92400E, #B45309);">
-    <span style="font-size:22px;">&#x1F3AF;</span>
-    <div>
-        <div style="font-size:17px; font-weight:700;">Target Variable: FutureCLV</div>
-        <div style="font-size:14px; color:rgba(248,250,252,0.6);">Sum of customer revenue in the 6-month prediction window (Dec 2010 &ndash; Jun 2011)</div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 6: Modeling ───────────────────────────────────────────────────
-def slide_06_modeling():
-    return wrap_slide("""
-<div class="section-tag">Modeling</div>
-<h2 class="slide-title">Modeling Strategy</h2>
-<p class="slide-subtitle">Comparing regularized linear models against tree-based ensembles</p>
-
-<div class="grid-2" style="flex:1;">
-    <div class="card card-accent-top" style="display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:20px;">Models Evaluated</div>
-        <div style="display:flex; flex-direction:column; gap:12px; flex:1;">
-            <div style="display:flex; align-items:center; gap:12px; padding:14px 18px; background:#F0F7FF; border-radius:10px; border-left: 3px solid #1A73E8;">
-                <div style="font-size:15px; font-weight:600; color:#0F172A; flex:1;">Linear Regression</div>
-                <div style="font-size:13px; color:#475569;">Baseline</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; padding:14px 18px; background:#F0F7FF; border-radius:10px; border-left: 3px solid #1A73E8;">
-                <div style="font-size:15px; font-weight:600; color:#0F172A; flex:1;">Ridge Regression</div>
-                <div style="font-size:13px; color:#475569;">L2 regularization</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; padding:14px 18px; background:linear-gradient(90deg, #EFF6FF, #DBEAFE); border-radius:10px; border-left: 3px solid #1A73E8;">
-                <div style="font-size:15px; font-weight:700; color:#1A73E8; flex:1;">&#11088; Lasso Regression</div>
-                <div style="font-size:13px; font-weight:600; color:#1A73E8;">Best Model</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; padding:14px 18px; background:#F0F7FF; border-radius:10px; border-left: 3px solid #6366F1;">
-                <div style="font-size:15px; font-weight:600; color:#0F172A; flex:1;">Random Forest</div>
-                <div style="font-size:13px; color:#475569;">Ensemble</div>
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; padding:14px 18px; background:#F0F7FF; border-radius:10px; border-left: 3px solid #6366F1;">
-                <div style="font-size:15px; font-weight:600; color:#0F172A; flex:1;">Gradient Boosting</div>
-                <div style="font-size:13px; color:#475569;">Ensemble</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="card" style="border-top: 4px solid #00C9A7; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:20px;">Strategy</div>
-        <div style="display:flex; flex-direction:column; gap:20px; flex:1;">
-            <div>
-                <div style="font-size:16px; font-weight:700; color:#0F172A; margin-bottom:8px;">Train / Test Split</div>
-                <p style="font-size:14px; color:#475569; line-height:1.6;">80/20 stratified split preserving CLV distribution. All features standardized via StandardScaler.</p>
-                <div style="margin-top:10px; height:8px; border-radius:4px; background:#E2E8F0; overflow:hidden;">
-                    <div style="width:80%; height:100%; background:linear-gradient(90deg, #1A73E8, #3B82F6); border-radius:4px;"></div>
-                </div>
-                <div style="display:flex; justify-content:space-between; margin-top:4px;">
-                    <span style="font-size:12px; color:#1A73E8; font-weight:600;">80% Train</span>
-                    <span style="font-size:12px; color:#475569; font-weight:600;">20% Test</span>
-                </div>
-            </div>
-            <div>
-                <div style="font-size:16px; font-weight:700; color:#0F172A; margin-bottom:8px;">Cross-Validation</div>
-                <p style="font-size:14px; color:#475569; line-height:1.6;">5-fold CV on training set. Best CV R&sup2; = 0.53 &plusmn; 0.18 (Lasso).</p>
-            </div>
-            <div>
-                <div style="font-size:16px; font-weight:700; color:#0F172A; margin-bottom:8px;">Hyperparameter Tuning</div>
-                <p style="font-size:14px; color:#475569; line-height:1.6;">Randomized search over alpha values. Best Lasso &alpha; = 4.90.</p>
-            </div>
-        </div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 7: Results ────────────────────────────────────────────────────
-def slide_07_results():
-    mc = img_b64(FIGURES / "model_comparison.png")
-    ba = img_b64(FIGURES / "best_model_analysis.png")
-    return wrap_slide(f"""
-<div class="section-tag">Results</div>
-<h2 class="slide-title">Model Performance</h2>
-<p class="slide-subtitle">Lasso Regression achieves the best balance of fit and generalization</p>
-
-<div class="grid-4" style="margin-bottom:24px;">
-    <div class="metric-card">
-        <div class="metric-value" style="color:#1A73E8;">0.810</div>
-        <div class="metric-label">Test R&sup2;</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#00C9A7;">
-        <div class="metric-value" style="color:#00C9A7;">&pound;1,756</div>
-        <div class="metric-label">RMSE</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#F59E0B;">
-        <div class="metric-value" style="color:#F59E0B;">&pound;545</div>
-        <div class="metric-label">MAE</div>
-    </div>
-    <div class="metric-card" style="border-top-color:#6366F1;">
-        <div class="metric-value" style="color:#6366F1;">0.53</div>
-        <div class="metric-label">CV R&sup2; (&plusmn; 0.18)</div>
-    </div>
-</div>
-
-<div class="grid-2" style="flex:1;">
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">Model Comparison</div>
-        <img src="{mc}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">Best Model Analysis</div>
-        <img src="{ba}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-</div>
-""")
-
-
-# ── Slide 8: Explainability ─────────────────────────────────────────────
-def slide_08_explainability():
-    fi = img_b64(FIGURES / "feature_importance.png")
-    ss = img_b64(FIGURES / "shap_summary.png")
-    return wrap_slide(f"""
-<div class="section-tag">Explainability</div>
-<h2 class="slide-title">Feature Importance &amp; SHAP Analysis</h2>
-<p class="slide-subtitle">Understanding what drives CLV predictions</p>
-
-<div class="grid-2" style="flex:1; margin-bottom:24px;">
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">Feature Importance (All Models)</div>
-        <img src="{fi}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">SHAP Summary Plot</div>
-        <img src="{ss}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-</div>
-
-<div class="banner" style="background:linear-gradient(135deg, #0A1628, #1E3A5F);">
-    <div style="width:44px; height:44px; border-radius:12px; background:rgba(26,115,232,0.2); display:flex; align-items:center; justify-content:center;">
-        <span style="color:#60A5FA; font-size:20px;">&#x1F4A1;</span>
-    </div>
-    <div style="flex:1;">
-        <div style="font-size:16px; font-weight:700;">Key Insight</div>
-        <div style="font-size:14px; color:rgba(248,250,252,0.6);">Monetary dominates with 3&times; the importance of Frequency. SHAP confirms a positive, near-linear relationship: higher past spending directly predicts higher future CLV.</div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 9: Lift ───────────────────────────────────────────────────────
-def slide_09_lift():
-    lc = img_b64(FIGURES / "lift_chart.png")
-    return wrap_slide(f"""
-<div class="section-tag">Lift Analysis</div>
-<h2 class="slide-title">Lift Chart &amp; Business Impact</h2>
-<p class="slide-subtitle">Quantifying the model's ability to identify high-value customers</p>
-
-<div style="display:flex; gap:24px; flex:1;">
-    <div class="card" style="flex:1.2; padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">Cumulative Lift Chart</div>
-        <img src="{lc}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-
-    <div style="flex:0.8; display:flex; flex-direction:column; gap:16px;">
-        <div class="card" style="border-left: 4px solid #1A73E8; flex:1; display:flex; flex-direction:column; justify-content:center;">
-            <div style="font-size:36px; font-weight:800; color:#1A73E8;">5.55&times;</div>
-            <div style="font-size:13px; font-weight:600; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-top:4px;">Lift @ Top 10%</div>
-            <p style="font-size:13px; color:#94A3B8; margin-top:8px;">Top decile captures 5.5&times; more value than random</p>
-        </div>
-        <div class="card" style="border-left: 4px solid #00C9A7; flex:1; display:flex; flex-direction:column; justify-content:center;">
-            <div style="font-size:36px; font-weight:800; color:#00C9A7;">3.62&times;</div>
-            <div style="font-size:13px; font-weight:600; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-top:4px;">Lift @ Top 20%</div>
-            <p style="font-size:13px; color:#94A3B8; margin-top:8px;">Top quintile still highly efficient for targeting</p>
-        </div>
-        <div class="card" style="border-left: 4px solid #F59E0B; flex:1; display:flex; flex-direction:column; justify-content:center;">
-            <div style="font-size:36px; font-weight:800; color:#F59E0B;">2.76&times;</div>
-            <div style="font-size:13px; font-weight:600; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-top:4px;">Lift @ Top 30%</div>
-            <p style="font-size:13px; color:#94A3B8; margin-top:8px;">Nearly 3&times; improvement over untargeted outreach</p>
-        </div>
-        <div class="card" style="border-left: 4px solid #6366F1; flex:1; display:flex; flex-direction:column; justify-content:center;">
-            <div style="font-size:36px; font-weight:800; color:#6366F1;">1.83&times;</div>
-            <div style="font-size:13px; font-weight:600; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-top:4px;">Lift @ Top 50%</div>
-            <p style="font-size:13px; color:#94A3B8; margin-top:8px;">Model adds value even at broader targeting</p>
-        </div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 10: Divider ───────────────────────────────────────────────────
-def slide_10_divider():
-    return wrap_slide("""
-<div style="display:flex; flex-direction:column; height:100%; justify-content:center; align-items:center; text-align:center;">
-    <div class="section-tag section-tag-dark" style="margin-bottom:32px;">Part II</div>
-    <h1 style="font-size:72px; font-weight:900; line-height:1.05;
-        background: linear-gradient(135deg, #FFFFFF 0%, #00C9A7 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-        Causal Inference
-    </h1>
-    <p style="font-size:22px; font-weight:300; color:rgba(248,250,252,0.45); margin-top:24px; max-width:600px;">
-        Moving beyond correlation to estimate the causal effect of purchase frequency on customer lifetime value
-    </p>
-    <div style="margin-top:48px; display:flex; gap:24px;">
-        <div style="padding:12px 24px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:10px;">
-            <div style="font-size:14px; color:rgba(248,250,252,0.4); font-weight:500;">Treatment</div>
-            <div style="font-size:18px; font-weight:700; color:#00C9A7;">High Frequency</div>
-        </div>
-        <div style="padding:12px 24px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:10px;">
-            <div style="font-size:14px; color:rgba(248,250,252,0.4); font-weight:500;">Outcome</div>
-            <div style="font-size:18px; font-weight:700; color:#60A5FA;">Future CLV</div>
-        </div>
-        <div style="padding:12px 24px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:10px;">
-            <div style="font-size:14px; color:rgba(248,250,252,0.4); font-weight:500;">Method</div>
-            <div style="font-size:18px; font-weight:700; color:#F59E0B;">Meta-Learners</div>
-        </div>
-    </div>
-</div>
-""", dark=True)
-
-
-# ── Slide 11: Causal Setup ──────────────────────────────────────────────
-def slide_11_causal_setup():
-    return wrap_slide("""
-<div class="section-tag">Causal Design</div>
-<h2 class="slide-title">Causal Inference Setup</h2>
-<p class="slide-subtitle">Estimating the Average Treatment Effect of high purchase frequency on CLV</p>
-
-<div class="grid-3" style="margin-bottom:24px;">
-    <div class="card" style="border-top: 4px solid #F59E0B;">
-        <div style="font-size:13px; font-weight:700; color:#F59E0B; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Treatment</div>
-        <div style="font-size:20px; font-weight:700; margin-bottom:8px;">High Frequency</div>
-        <p style="font-size:14px; color:#475569; line-height:1.7;">
-            Binary indicator: customer is above the median purchase frequency. Simulates a &ldquo;loyalty program&rdquo; or &ldquo;re-engagement&rdquo; intervention.
-        </p>
-    </div>
-    <div class="card" style="border-top: 4px solid #1A73E8;">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Outcome</div>
-        <div style="font-size:20px; font-weight:700; margin-bottom:8px;">log(1 + FutureCLV)</div>
-        <p style="font-size:14px; color:#475569; line-height:1.7;">
-            Log-transformed future CLV to handle right-skewed distribution and make treatment effects interpretable on a relative scale.
-        </p>
-    </div>
-    <div class="card" style="border-top: 4px solid #00C9A7;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:12px;">Controls</div>
-        <div style="font-size:20px; font-weight:700; margin-bottom:8px;">Confounders</div>
-        <p style="font-size:14px; color:#475569; line-height:1.7;">
-            Recency, Monetary, Tenure, AvgOrderValue, AvgBasketSize, NumUniqueProducts, AvgTimeBetweenPurchases.
-        </p>
-    </div>
-</div>
-
-<div class="grid-2">
-    <div class="card" style="padding:24px; display:flex; align-items:center; gap:20px;">
-        <div style="width:56px; height:56px; border-radius:14px; background:linear-gradient(135deg, #EEF2FF, #DBEAFE); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:24px; font-weight:800; color:#1A73E8;">S</span>
-        </div>
-        <div>
-            <div style="font-size:16px; font-weight:700; color:#0F172A;">S-Learner (LRS Regressor)</div>
-            <div style="font-size:14px; color:#475569; margin-top:4px;">Single model with treatment as feature. Estimates ATE via counterfactual prediction.</div>
-        </div>
-    </div>
-    <div class="card" style="padding:24px; display:flex; align-items:center; gap:20px;">
-        <div style="width:56px; height:56px; border-radius:14px; background:linear-gradient(135deg, #ECFDF5, #D1FAE5); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:24px; font-weight:800; color:#00C9A7;">T</span>
-        </div>
-        <div>
-            <div style="font-size:16px; font-weight:700; color:#0F172A;">T-Learner (XGB Regressor)</div>
-            <div style="font-size:14px; color:#475569; margin-top:4px;">Separate models for treated/control groups. More flexible, captures heterogeneous effects.</div>
-        </div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 12: Causal Results ────────────────────────────────────────────
-def slide_12_causal_results():
-    cd = img_b64(REPORTS / "causal_cate_distribution.png")
-    cf = img_b64(REPORTS / "causal_feature_importance.png")
-    return wrap_slide(f"""
-<div class="section-tag">Causal Results</div>
-<h2 class="slide-title">Causal Inference Results</h2>
-<p class="slide-subtitle">Both meta-learners estimate a negative average treatment effect</p>
-
-<div style="display:flex; gap:24px; margin-bottom:24px;">
-    <div class="metric-card" style="flex:1; border-top-color:#1A73E8;">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">S-Learner (LRS)</div>
-        <div class="metric-value" style="color:#1A73E8;">&minus;0.179</div>
-        <div style="font-size:13px; color:#94A3B8; margin-top:8px;">CI: [&minus;0.378, +0.021]</div>
-    </div>
-    <div class="metric-card" style="flex:1; border-top-color:#00C9A7;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">T-Learner (XGB)</div>
-        <div class="metric-value" style="color:#00C9A7;">&minus;0.167</div>
-        <div style="font-size:13px; color:#94A3B8; margin-top:8px;">CI: [&minus;0.258, &minus;0.077]</div>
-    </div>
-    <div class="card" style="flex:2; padding:24px; background:linear-gradient(135deg, #FFFBEB, #FEF3C7); border: 1px solid #FDE68A;">
-        <div style="font-size:13px; font-weight:700; color:#92400E; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px;">Interpretation</div>
-        <p style="font-size:14px; color:#78350F; line-height:1.7;">
-            High purchase frequency does <strong>not</strong> causally increase CLV. The negative ATE (&sim;&minus;0.17 on log scale) suggests that after controlling for confounders,
-            high-frequency buyers may be <strong>deal-seekers</strong> with lower per-transaction value. Correlation &ne; causation.
-        </p>
-    </div>
-</div>
-
-<div class="grid-2" style="flex:1;">
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">CATE Distribution</div>
-        <img src="{cd}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-    <div class="card" style="padding:16px; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#475569; text-transform:uppercase; letter-spacing:1px; margin-bottom:12px;">Causal Feature Importance</div>
-        <img src="{cf}" class="chart-img" style="flex:1; object-fit:contain;">
-    </div>
-</div>
-""")
-
-
-# ── Slide 13: Threats ───────────────────────────────────────────────────
-def slide_13_threats():
-    return wrap_slide("""
-<div class="section-tag">Validity</div>
-<h2 class="slide-title">Threats to Validity</h2>
-<p class="slide-subtitle">Acknowledging limitations and potential biases in our analysis</p>
-
-<div style="display:flex; flex-direction:column; gap:16px; flex:1;">
-    <div class="card card-accent-left" style="display:flex; align-items:flex-start; gap:20px; flex:1; border-left-color:#EF4444;">
-        <div style="width:44px; height:44px; border-radius:12px; background:rgba(239,68,68,0.08); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:20px; font-weight:800; color:#EF4444;">1</span>
-        </div>
-        <div>
-            <div style="font-size:17px; font-weight:700; color:#0F172A; margin-bottom:6px;">Selection Bias in Treatment Assignment</div>
-            <p style="font-size:14px; color:#475569; line-height:1.6;">Frequency is observed, not randomized. The median split may conflate inherently loyal customers with those influenced by external factors. Propensity score matching could help, but unobserved confounders remain.</p>
-        </div>
-    </div>
-    <div class="card card-accent-left" style="display:flex; align-items:flex-start; gap:20px; flex:1; border-left-color:#F59E0B;">
-        <div style="width:44px; height:44px; border-radius:12px; background:rgba(245,158,11,0.08); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:20px; font-weight:800; color:#F59E0B;">2</span>
-        </div>
-        <div>
-            <div style="font-size:17px; font-weight:700; color:#0F172A; margin-bottom:6px;">CV vs Test Gap (0.53 &rarr; 0.81)</div>
-            <p style="font-size:14px; color:#475569; line-height:1.6;">The gap between cross-validation R&sup2; (0.53) and test R&sup2; (0.81) may indicate favorable test split or temporal patterns. Additional temporal CV would strengthen confidence.</p>
-        </div>
-    </div>
-    <div class="card card-accent-left" style="display:flex; align-items:flex-start; gap:20px; flex:1; border-left-color:#1A73E8;">
-        <div style="width:44px; height:44px; border-radius:12px; background:rgba(26,115,232,0.08); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:20px; font-weight:800; color:#1A73E8;">3</span>
-        </div>
-        <div>
-            <div style="font-size:17px; font-weight:700; color:#0F172A; margin-bottom:6px;">Single-Geography, Single-Period</div>
-            <p style="font-size:14px; color:#475569; line-height:1.6;">Data comes from one UK retailer in 2010&ndash;2011. Generalization to other markets, product categories, or time periods is not guaranteed.</p>
-        </div>
-    </div>
-    <div class="card card-accent-left" style="display:flex; align-items:flex-start; gap:20px; flex:1; border-left-color:#6366F1;">
-        <div style="width:44px; height:44px; border-radius:12px; background:rgba(99,102,241,0.08); display:flex; align-items:center; justify-content:center; flex-shrink:0;">
-            <span style="font-size:20px; font-weight:800; color:#6366F1;">4</span>
-        </div>
-        <div>
-            <div style="font-size:17px; font-weight:700; color:#0F172A; margin-bottom:6px;">Limited Feature Set</div>
-            <p style="font-size:14px; color:#475569; line-height:1.6;">8 RFM-based features capture purchase behavior but miss demographics, marketing touchpoints, seasonality, and product affinity &mdash; factors that likely influence CLV.</p>
-        </div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 14: Monitoring ────────────────────────────────────────────────
-def slide_14_monitoring():
-    return wrap_slide("""
-<div class="section-tag">Production</div>
-<h2 class="slide-title">Monitoring &amp; Deployment Plan</h2>
-<p class="slide-subtitle">Ensuring model reliability in production through drift detection and scheduled retraining</p>
-
-<div class="grid-3" style="flex:1; margin-bottom:24px;">
-    <div class="card card-accent-top" style="display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#1A73E8; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px;">Production Checks</div>
-        <div style="display:flex; flex-direction:column; gap:12px; flex:1;">
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#00C9A7;"></div>
-                <span style="font-size:14px; color:#475569;">Input schema validation</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#00C9A7;"></div>
-                <span style="font-size:14px; color:#475569;">Feature range checks</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#00C9A7;"></div>
-                <span style="font-size:14px; color:#475569;">Prediction distribution monitoring</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#00C9A7;"></div>
-                <span style="font-size:14px; color:#475569;">Latency &amp; throughput SLAs</span>
-            </div>
-        </div>
-    </div>
-    <div class="card" style="border-top: 4px solid #F59E0B; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#F59E0B; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px;">Alert Thresholds</div>
-        <div style="display:flex; flex-direction:column; gap:12px; flex:1;">
-            <div style="padding:12px 16px; background:#FFFBEB; border-radius:8px;">
-                <div style="font-size:13px; font-weight:600; color:#92400E;">PSI &gt; 0.1</div>
-                <div style="font-size:12px; color:#A16207;">Moderate drift &mdash; investigate</div>
-            </div>
-            <div style="padding:12px 16px; background:#FEF2F2; border-radius:8px;">
-                <div style="font-size:13px; font-weight:600; color:#991B1B;">PSI &gt; 0.25</div>
-                <div style="font-size:12px; color:#B91C1C;">Severe drift &mdash; trigger retrain</div>
-            </div>
-            <div style="padding:12px 16px; background:#FEF2F2; border-radius:8px;">
-                <div style="font-size:13px; font-weight:600; color:#991B1B;">R&sup2; drop &gt; 15%</div>
-                <div style="font-size:12px; color:#B91C1C;">Performance degradation &mdash; retrain</div>
-            </div>
-        </div>
-    </div>
-    <div class="card" style="border-top: 4px solid #00C9A7; display:flex; flex-direction:column;">
-        <div style="font-size:13px; font-weight:700; color:#00C9A7; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px;">Maintenance</div>
-        <div style="display:flex; flex-direction:column; gap:12px; flex:1;">
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#1A73E8;"></div>
-                <span style="font-size:14px; color:#475569;">Quarterly scheduled retraining</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#1A73E8;"></div>
-                <span style="font-size:14px; color:#475569;">Automated drift-triggered retrain</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#1A73E8;"></div>
-                <span style="font-size:14px; color:#475569;">Champion/challenger testing</span>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px;">
-                <div style="width:8px; height:8px; border-radius:50%; background:#1A73E8;"></div>
-                <span style="font-size:14px; color:#475569;">Model versioning &amp; rollback</span>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="banner" style="background:linear-gradient(135deg, #064E3B, #065F46);">
-    <div style="width:10px; height:10px; border-radius:50%; background:#00C9A7; box-shadow: 0 0 8px #00C9A7;"></div>
-    <div style="flex:1;">
-        <div style="font-size:16px; font-weight:700;">All Features Stable &mdash; Max PSI = 0.035</div>
-        <div style="font-size:14px; color:rgba(248,250,252,0.6);">Simulated drift test shows no feature exceeds the 0.1 warning threshold. Model is production-ready.</div>
-    </div>
-</div>
-""")
-
-
-# ── Slide 15: Conclusions ───────────────────────────────────────────────
-def slide_15_conclusions():
-    return wrap_slide("""
-<div style="display:flex; flex-direction:column; height:100%; justify-content:center; align-items:center; text-align:center;">
-    <div class="section-tag section-tag-dark" style="margin-bottom:24px;">Conclusions</div>
-    <h1 style="font-size:56px; font-weight:900; line-height:1.1; margin-bottom:48px; max-width:1100px;
-        background: linear-gradient(135deg, #FFFFFF 0%, #94C4FF 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-        Key Takeaways
-    </h1>
-
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px 48px; max-width:1200px; text-align:left; margin-bottom:48px;">
-        <div style="display:flex; align-items:flex-start; gap:16px;">
-            <div style="width:12px; height:12px; border-radius:50%; background:#1A73E8; margin-top:6px; flex-shrink:0;"></div>
-            <div>
-                <div style="font-size:18px; font-weight:700; margin-bottom:4px;">Lasso achieves R&sup2; = 0.81</div>
-                <div style="font-size:14px; color:rgba(248,250,252,0.5); line-height:1.5;">Regularized regression outperforms tree-based models on this dataset, with strong predictive power and interpretability.</div>
-            </div>
-        </div>
-        <div style="display:flex; align-items:flex-start; gap:16px;">
-            <div style="width:12px; height:12px; border-radius:50%; background:#00C9A7; margin-top:6px; flex-shrink:0;"></div>
-            <div>
-                <div style="font-size:18px; font-weight:700; margin-bottom:4px;">5.55&times; lift in top decile</div>
-                <div style="font-size:14px; color:rgba(248,250,252,0.5); line-height:1.5;">Model-driven targeting captures 5&times; more value than random selection &mdash; direct ROI for marketing spend.</div>
-            </div>
-        </div>
-        <div style="display:flex; align-items:flex-start; gap:16px;">
-            <div style="width:12px; height:12px; border-radius:50%; background:#F59E0B; margin-top:6px; flex-shrink:0;"></div>
-            <div>
-                <div style="font-size:18px; font-weight:700; margin-bottom:4px;">Frequency &ne; causal driver</div>
-                <div style="font-size:14px; color:rgba(248,250,252,0.5); line-height:1.5;">Causal analysis reveals high frequency does not increase CLV &mdash; challenging the &ldquo;more visits = more value&rdquo; assumption.</div>
-            </div>
-        </div>
-        <div style="display:flex; align-items:flex-start; gap:16px;">
-            <div style="width:12px; height:12px; border-radius:50%; background:#6366F1; margin-top:6px; flex-shrink:0;"></div>
-            <div>
-                <div style="font-size:18px; font-weight:700; margin-bottom:4px;">Production-ready pipeline</div>
-                <div style="font-size:14px; color:rgba(248,250,252,0.5); line-height:1.5;">Full monitoring with PSI drift detection (all stable at &lt; 0.035), automated alerts, and quarterly retraining schedule.</div>
-            </div>
-        </div>
-    </div>
-
-    <div style="padding:20px 40px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:14px; margin-bottom:32px;">
-        <div style="font-size:13px; font-weight:600; color:rgba(248,250,252,0.35); text-transform:uppercase; letter-spacing:2px; margin-bottom:8px;">Next Steps</div>
-        <div style="font-size:16px; color:rgba(248,250,252,0.7);">
-            Add temporal cross-validation &bull; Integrate product-level features &bull; A/B test targeting strategies &bull; Expand to multi-market
-        </div>
-    </div>
-
-    <div style="font-size:48px; font-weight:900; margin-bottom:8px;
-        background: linear-gradient(135deg, #1A73E8, #00C9A7); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-        Thank You
-    </div>
-    <p style="font-size:16px; color:rgba(248,250,252,0.35);">Questions &amp; Discussion</p>
-</div>
-""", dark=True)
-
-
-# ── All slides ──────────────────────────────────────────────────────────
-ALL_SLIDES = [
-    slide_01_title,
-    slide_02_context,
-    slide_03_hypotheses,
-    slide_04_data,
-    slide_05_features,
-    slide_06_modeling,
-    slide_07_results,
-    slide_08_explainability,
-    slide_09_lift,
-    slide_10_divider,
-    slide_11_causal_setup,
-    slide_12_causal_results,
-    slide_13_threats,
-    slide_14_monitoring,
-    slide_15_conclusions,
-]
-
-
-# ── Screenshot via Playwright ───────────────────────────────────────────
-async def capture_slides():
+async def html_to_pdf(html_path: Path, pdf_path: Path) -> None:
     from playwright.async_api import async_playwright
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page(viewport={"width": 1920, "height": 1080})
+    file_url = html_path.resolve().as_uri()
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page(viewport={"width": 1920, "height": 1080})
+            await page.goto(file_url, wait_until="networkidle")
+            await page.pdf(
+                path=str(pdf_path),
+                print_background=True,
+                width="13.333in",
+                height="7.5in",
+                margin={"top": "0in", "right": "0in", "bottom": "0in", "left": "0in"},
+            )
+            await browser.close()
+    except Exception:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page(viewport={"width": 1920, "height": 1080})
+            await page.goto(file_url, wait_until="networkidle")
+            await page.pdf(
+                path=str(pdf_path),
+                print_background=True,
+                width="13.333in",
+                height="7.5in",
+                margin={"top": "0in", "right": "0in", "bottom": "0in", "left": "0in"},
+            )
+            await browser.close()
 
-        for i, slide_fn in enumerate(ALL_SLIDES, 1):
-            html = slide_fn()
-            await page.set_content(html)
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(800)
 
-            path = PREVIEWS / f"slide_{i:02d}.png"
-            await page.screenshot(path=str(path), type="png")
-            print(f"  [ok] Slide {i:02d} captured")
+def _add_bg(slide, dark: bool = False) -> None:
+    bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
+    bg.fill.solid()
+    if dark:
+        bg.fill.fore_color.rgb = RGBColor(16, 37, 57)
+    else:
+        bg.fill.fore_color.rgb = RGBColor(248, 245, 241)
+    bg.line.fill.background()
 
-        await browser.close()
+    bubble1 = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(10.8), Inches(-1.0), Inches(3.0), Inches(3.0))
+    bubble1.fill.solid()
+    bubble1.fill.fore_color.rgb = RGBColor(46, 196, 182)
+    bubble1.fill.transparency = 0.72
+    bubble1.line.fill.background()
+
+    bubble2 = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(-1.2), Inches(5.8), Inches(3.2), Inches(3.2))
+    bubble2.fill.solid()
+    bubble2.fill.fore_color.rgb = RGBColor(0, 168, 232)
+    bubble2.fill.transparency = 0.78
+    bubble2.line.fill.background()
 
 
-# ── Assemble PPTX ──────────────────────────────────────────────────────
-def assemble_pptx():
-    from pptx import Presentation
-    from pptx.util import Inches, Emu
+def _write_text(shape, text: str, size: int = 20, bold: bool = False, color: RGBColor = RGBColor(12, 24, 33),
+                align: PP_ALIGN = PP_ALIGN.LEFT, font: str = "Avenir Next") -> None:
+    tf = shape.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    p.text = text
+    p.alignment = align
+    run = p.runs[0]
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.name = font
+    run.font.color.rgb = color
 
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)  # 16:9
-    prs.slide_height = Inches(7.5)
 
-    for i in range(1, 16):
-        img_path = PREVIEWS / f"slide_{i:02d}.png"
-        slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+def _add_bullet_box(slide, x, y, w, h, bullets: List[str], dark: bool = False) -> None:
+    box = slide.shapes.add_textbox(x, y, w, h)
+    tf = box.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    for i, item in enumerate(bullets):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = item
+        p.level = 0
+        p.space_after = Pt(8)
+        p.font.name = "Avenir Next"
+        p.font.size = Pt(22)
+        p.font.bold = False
+        p.font.color.rgb = RGBColor(223, 237, 248) if dark else RGBColor(18, 34, 47)
+
+
+def _add_summary_box(slide, summary: List[str], x: float, y: float, w: float, h: float) -> None:
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = box.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    for i, item in enumerate(summary):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = f"• {item}"
+        p.level = 0
+        p.space_after = Pt(3)
+        p.font.name = "Avenir Next"
+        p.font.size = Pt(14)
+        p.font.bold = False
+        p.font.color.rgb = RGBColor(25, 45, 60)
+
+
+def _gallery_slots(count: int, y_top: float) -> List[Tuple[float, float, float, float]]:
+    if count <= 2:
+        return [
+            (0.7, y_top, 5.9, 4.35),
+            (6.75, y_top, 5.9, 4.35),
+        ][:count]
+    if count == 5:
+        return [
+            (0.7, y_top, 3.85, 2.1),
+            (4.75, y_top, 3.85, 2.1),
+            (8.8, y_top, 3.85, 2.1),
+            (0.7, y_top + 2.25, 5.9, 2.1),
+            (6.75, y_top + 2.25, 5.9, 2.1),
+        ]
+    return [
+        (0.7, y_top, 5.9, 2.25),
+        (6.75, y_top, 5.9, 2.25),
+        (0.7, y_top + 2.4, 5.9, 2.25),
+        (6.75, y_top + 2.4, 5.9, 2.25),
+    ][:count]
+
+
+def _add_gallery_panel(slide, path: Path, caption: str, x: float, y: float, w: float, h: float) -> None:
+    panel = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    panel.fill.solid()
+    panel.fill.fore_color.rgb = RGBColor(255, 255, 255)
+    panel.line.color.rgb = RGBColor(225, 234, 242)
+    panel.line.width = Pt(1)
+
+    img_x = x + 0.08
+    img_y = y + 0.08
+    img_w = max(0.1, w - 0.16)
+    img_h = max(0.1, h - 0.48)
+
+    if path.exists():
+        # Fit image to panel without cropping; preserve aspect ratio and center it.
+        try:
+            from PIL import Image  # type: ignore
+
+            with Image.open(path) as im:
+                px_w, px_h = im.size
+            if px_w > 0 and px_h > 0:
+                box_ratio = img_w / img_h
+                img_ratio = px_w / px_h
+                if img_ratio > box_ratio:
+                    draw_w = img_w
+                    draw_h = img_w / img_ratio
+                    draw_x = img_x
+                    draw_y = img_y + (img_h - draw_h) / 2
+                else:
+                    draw_h = img_h
+                    draw_w = img_h * img_ratio
+                    draw_x = img_x + (img_w - draw_w) / 2
+                    draw_y = img_y
+            else:
+                draw_x, draw_y, draw_w, draw_h = img_x, img_y, img_w, img_h
+        except Exception:
+            draw_x, draw_y, draw_w, draw_h = img_x, img_y, img_w, img_h
+
         slide.shapes.add_picture(
-            str(img_path), Emu(0), Emu(0),
-            prs.slide_width, prs.slide_height,
+            str(path),
+            Inches(draw_x),
+            Inches(draw_y),
+            width=Inches(draw_w),
+            height=Inches(draw_h),
+        )
+    else:
+        missing = slide.shapes.add_textbox(Inches(x + 0.1), Inches(y + 0.2), Inches(w - 0.2), Inches(h - 0.7))
+        _write_text(
+            missing,
+            f"Missing image: {path.name}",
+            size=12,
+            bold=False,
+            color=RGBColor(71, 85, 105),
+            align=PP_ALIGN.CENTER,
+            font="Avenir Next",
         )
 
-    out = DELIVERABLES / "final_presentation.pptx"
-    prs.save(str(out))
-    print(f"  [ok] PPTX saved: {out}")
+    cap = slide.shapes.add_textbox(Inches(x + 0.1), Inches(y + h - 0.33), Inches(w - 0.2), Inches(0.25))
+    _write_text(
+        cap,
+        caption,
+        size=11,
+        bold=False,
+        color=RGBColor(41, 59, 75),
+        align=PP_ALIGN.CENTER,
+        font="Avenir Next",
+    )
 
 
-# ── Assemble PDF ────────────────────────────────────────────────────────
-def assemble_pdf():
-    from PIL import Image
+def build_editable_pptx(slides: List[Dict[str, object]], out_path: Path) -> None:
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
 
-    images = []
-    for i in range(1, 16):
-        img_path = PREVIEWS / f"slide_{i:02d}.png"
-        img = Image.open(img_path).convert("RGB")
-        images.append(img)
+    for s in slides:
+        layout = str(s.get("layout"))
+        dark = layout in {"hero", "section"}
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        _add_bg(slide, dark=dark)
 
-    out = DELIVERABLES / "final_presentation.pdf"
-    images[0].save(str(out), save_all=True, append_images=images[1:])
-    print(f"  [ok] PDF saved: {out}")
+        # Kicker
+        kicker_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.4), Inches(5.5), Inches(0.4))
+        _write_text(
+            kicker_box,
+            str(s.get("kicker", "")),
+            size=12,
+            bold=True,
+            color=RGBColor(214, 231, 245) if dark else RGBColor(35, 111, 150),
+            font="Avenir Next",
+        )
+
+        title_box = slide.shapes.add_textbox(Inches(0.7), Inches(0.8), Inches(11.9), Inches(1.2))
+        _write_text(
+            title_box,
+            str(s.get("title", "")),
+            size=46 if layout in {"hero", "section"} else 36,
+            bold=True,
+            color=RGBColor(248, 251, 255) if dark else RGBColor(12, 24, 33),
+            font="Avenir Next",
+        )
+
+        if layout in {"hero", "section"}:
+            sub_box = slide.shapes.add_textbox(Inches(0.9), Inches(2.2), Inches(11.5), Inches(2.6))
+            _write_text(
+                sub_box,
+                str(s.get("subtitle", "")),
+                size=22,
+                bold=False,
+                color=RGBColor(220, 235, 246),
+                align=PP_ALIGN.CENTER,
+                font="Avenir Next",
+            )
+            if s.get("footer"):
+                footer = slide.shapes.add_textbox(Inches(0.9), Inches(6.5), Inches(11.5), Inches(0.5))
+                _write_text(
+                    footer,
+                    str(s.get("footer", "")),
+                    size=14,
+                    color=RGBColor(220, 235, 246),
+                    align=PP_ALIGN.CENTER,
+                    font="Avenir Next",
+                )
+            continue
+
+        if layout == "split":
+            left = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.7), Inches(2.0), Inches(6.1), Inches(4.8))
+            left.fill.solid()
+            left.fill.fore_color.rgb = RGBColor(255, 255, 255)
+            left.line.color.rgb = RGBColor(233, 240, 246)
+            left.line.width = Pt(1)
+
+            right = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.95), Inches(2.0), Inches(5.65), Inches(4.8))
+            right.fill.solid()
+            right.fill.fore_color.rgb = RGBColor(255, 255, 255)
+            right.line.color.rgb = RGBColor(233, 240, 246)
+            right.line.width = Pt(1)
+
+            left_title = slide.shapes.add_textbox(Inches(1.0), Inches(2.2), Inches(5.5), Inches(0.5))
+            _write_text(left_title, str(s.get("left_title", "")), size=24, bold=True)
+            right_title = slide.shapes.add_textbox(Inches(7.25), Inches(2.2), Inches(4.9), Inches(0.5))
+            _write_text(right_title, str(s.get("right_title", "")), size=24, bold=True)
+
+            _add_bullet_box(slide, Inches(1.0), Inches(2.8), Inches(5.5), Inches(3.8), list(s.get("left_bullets", [])))
+            _add_bullet_box(slide, Inches(7.25), Inches(2.8), Inches(4.9), Inches(3.8), list(s.get("right_bullets", [])))
+            continue
+
+        if layout == "stats":
+            stats = list(s.get("stats", []))
+            for i, (label, value) in enumerate(stats):
+                x = 0.7 + i * 3.12
+                card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(x), Inches(2.0), Inches(2.9), Inches(1.45))
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(255, 255, 255)
+                card.line.color.rgb = RGBColor(233, 240, 246)
+                card.line.width = Pt(1)
+                v = slide.shapes.add_textbox(Inches(x + 0.2), Inches(2.15), Inches(2.5), Inches(0.65))
+                _write_text(v, str(value), size=30, bold=True, color=RGBColor(12, 81, 107))
+                l = slide.shapes.add_textbox(Inches(x + 0.2), Inches(2.85), Inches(2.5), Inches(0.35))
+                _write_text(l, str(label), size=11, bold=True, color=RGBColor(75, 85, 99))
+
+            _add_bullet_box(slide, Inches(0.9), Inches(3.7), Inches(12.0), Inches(2.7), list(s.get("bullets", [])))
+            continue
+
+        if layout == "table":
+            headers = list(s.get("headers", []))
+            rows = list(s.get("rows", []))
+            table = slide.shapes.add_table(len(rows) + 1, len(headers), Inches(0.6), Inches(2.0), Inches(12.1), Inches(4.8)).table
+            for j, h in enumerate(headers):
+                c = table.cell(0, j)
+                c.text = str(h)
+                p = c.text_frame.paragraphs[0]
+                p.font.name = "Avenir Next"
+                p.font.size = Pt(14)
+                p.font.bold = True
+                p.font.color.rgb = RGBColor(248, 251, 255)
+                c.fill.solid()
+                c.fill.fore_color.rgb = RGBColor(16, 43, 64)
+            for i, row in enumerate(rows, start=1):
+                for j, v in enumerate(row):
+                    c = table.cell(i, j)
+                    c.text = str(v)
+                    p = c.text_frame.paragraphs[0]
+                    p.font.name = "Avenir Next"
+                    p.font.size = Pt(13)
+                    p.font.color.rgb = RGBColor(12, 24, 33)
+                    c.fill.solid()
+                    c.fill.fore_color.rgb = RGBColor(249, 252, 255) if i % 2 == 0 else RGBColor(255, 255, 255)
+            continue
+
+        if layout == "gallery":
+            summary = [str(x) for x in list(s.get("summary", []))]
+            y_top = 1.95
+            if summary:
+                _add_summary_box(slide, summary, x=0.8, y=1.8, w=12.0, h=0.55)
+                y_top = 2.15
+
+            images = _image_specs(s)
+            slots = _gallery_slots(len(images), y_top=y_top)
+            for spec, (x, y, w, h) in zip(images, slots):
+                _add_gallery_panel(
+                    slide,
+                    path=Path(str(spec["path"])),
+                    caption=str(spec["caption"]),
+                    x=x,
+                    y=y,
+                    w=w,
+                    h=h,
+                )
+            continue
+
+        # bullets / bullets_with_image default branch.
+        has_image = layout == "bullets_with_image"
+        bullet_w = Inches(7.6 if has_image else 12.0)
+        _add_bullet_box(slide, Inches(0.8), Inches(2.0), bullet_w, Inches(4.8), list(s.get("bullets", [])))
+
+        if has_image:
+            image_path = Path(str(s.get("image", "")))
+            if image_path.exists():
+                box_x, box_y, box_w, box_h = 8.6, 2.0, 4.2, 4.8
+                draw_x, draw_y, draw_w, draw_h = box_x, box_y, box_w, box_h
+                try:
+                    from PIL import Image  # type: ignore
+
+                    with Image.open(image_path) as im:
+                        px_w, px_h = im.size
+                    if px_w > 0 and px_h > 0:
+                        box_ratio = box_w / box_h
+                        img_ratio = px_w / px_h
+                        if img_ratio > box_ratio:
+                            draw_w = box_w
+                            draw_h = box_w / img_ratio
+                            draw_x = box_x
+                            draw_y = box_y + (box_h - draw_h) / 2
+                        else:
+                            draw_h = box_h
+                            draw_w = box_h * img_ratio
+                            draw_x = box_x + (box_w - draw_w) / 2
+                            draw_y = box_y
+                except Exception:
+                    pass
+
+                slide.shapes.add_picture(
+                    str(image_path),
+                    Inches(draw_x),
+                    Inches(draw_y),
+                    width=Inches(draw_w),
+                    height=Inches(draw_h),
+                )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(out_path))
 
 
-# ── Main ────────────────────────────────────────────────────────────────
-async def main():
-    print("=" * 60)
-    print("  CLV Presentation Generator")
-    print("=" * 60)
+def write_html(slides: List[Dict[str, object]], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(render_html(slides), encoding="utf-8")
 
-    print("\nCapturing slides with Playwright...\n")
-    await capture_slides()
 
-    print("\nAssembling PPTX...\n")
-    assemble_pptx()
+async def main() -> None:
+    DELIVERABLES.mkdir(parents=True, exist_ok=True)
+    metrics = load_dynamic_metrics()
+    slides = build_slides(metrics)
 
-    print("\nAssembling PDF...\n")
-    assemble_pdf()
+    print("[1/3] Building HTML...")
+    write_html(slides, HTML_OUT)
+    print(f"  - {HTML_OUT}")
 
-    print("\n" + "=" * 60)
-    print("  Done! Files saved to deliverables/")
-    print("=" * 60)
+    print("[2/3] Converting HTML to PDF...")
+    await html_to_pdf(HTML_OUT, PDF_OUT)
+    print(f"  - {PDF_OUT}")
+
+    print("[3/3] Converting HTML content to editable PPTX...")
+    build_editable_pptx(slides, PPTX_OUT)
+    print(f"  - {PPTX_OUT}")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
